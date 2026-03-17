@@ -46,13 +46,43 @@ This document describes the design for a collection/shard-level primary key (PK)
 - Upsert: Same as point query for deduplication check
 - Delete: BF-based forwarding to candidate segments
 
-### 1.2 Opportunity
+### 1.2 Current Deduplication Mechanisms
+
+**Critical Understanding:** Milvus uses **timestamp-versioned, lazy deduplication**:
+
+1. **No immediate PK uniqueness enforcement** - Multiple versions of same PK can coexist
+2. **Deduplication is query-time + compaction-time**, not insert-time
+3. **Timestamp ordering:** Entity at `insertTs` is deleted if `insertTs < deleteTs`
+4. **Upsert = delete + insert at SAME timestamp** - Special case where `insertTs == deleteTs` means NOT deleted
+5. **Delete buffer (L0 segments)** maintains `[PK, deleteTimestamp]` pairs for query-time filtering
+6. **Compaction** performs final cleanup using timestamp-based EntityFilter
+
+**Current Upsert Flow (Proxy-based):**
+```
+Upsert Request
+    ↓
+Proxy: CheckDuplicatePkExist() - reject duplicates within batch
+    ↓
+Proxy: queryPreExecute() - retrieve existing PKs via bloom filter scan
+    ↓
+Proxy: Pack DeleteMsg + InsertMsg (both at same timestamp)
+    ↓
+Streaming Service → DataNode
+```
+
+**Limitations:**
+- Upsert requires expensive proxy-side PK query (bloom filter scan across segments)
+- Regular inserts don't check for duplicates - rely on compaction for cleanup
+- Cross-batch duplicate inserts both survive until compaction
+
+### 1.3 Opportunity
 
 A dedicated PK index at shard level can:
 - Provide exact PK→SegmentID mapping (no false positives)
 - Reduce query latency by eliminating segment scanning
 - Use less memory per key with BBHash (3-4 bits vs. 8-12 bits)
 - Enable faster upsert deduplication and delete routing
+- **Enable automatic deduplication on insert** by checking PK index at message ingestion point
 
 ## 2. Overall Architecture
 
@@ -205,6 +235,145 @@ Query PK → StreamingNode
 - StreamingNode loads latest available version
 - Graceful transition: queries can use old version during new version loading
 
+### 3.4 Automatic Deduplication on Insert
+
+**Design Decision:** StreamingNode performs automatic deduplication for all inserts by checking PK index before forwarding messages.
+
+#### Why StreamingNode, Not Proxy?
+
+**Option A (Proxy-based) - REJECTED due to race condition:**
+```
+Time    Client1                     Client2
+T1      Proxy: Query PK index
+        → "PK not exist"
+T2                                  Proxy: Query PK index
+                                    → "PK not exist"
+T3      Proxy: Send INSERT
+T4                                  Proxy: Send INSERT
+T5      Both inserts reach stream → DUPLICATE! ❌
+```
+
+**Problem:** Gap between "check" and "insert" allows concurrent inserts to bypass deduplication.
+
+**Option B (StreamingNode) - CHOSEN for consistency:**
+```
+StreamingNode processes messages sequentially per shard:
+
+T1      Receive INSERT PK=123 from Client1
+        → Check index: not exist
+        → Forward INSERT
+        → (Index will be updated after segment flush)
+
+T2      Receive INSERT PK=123 from Client2
+        → Check index: EXISTS in SegmentX
+        → Inject DELETE for SegmentX at same timestamp
+        → Forward INSERT
+```
+
+**Serialization at message ingestion** ensures consistency.
+
+#### Deduplication Flow
+
+**Insert Message Processing:**
+```go
+// Pseudocode for StreamingNode
+func (s *StreamingNode) ProcessInsertMsg(msg *InsertMsg) error {
+    if !s.config.AutoDedupOnInsert {
+        return s.stream.Append(msg)  // Feature disabled
+    }
+
+    for _, pk := range msg.PrimaryKeys {
+        // Query shard-level PK index
+        segs := s.pkIndex.Query(pk, msg.ShardID)
+
+        if len(segs) > 0 {
+            // PK exists in sealed segments - inject delete
+            deleteMsg := &DeleteMsg{
+                CollectionID: msg.CollectionID,
+                PartitionID:  msg.PartitionID,
+                PrimaryKeys:  []PrimaryKey{pk},
+                Timestamps:   []uint64{msg.Timestamp},  // Same TS as insert
+                SegmentIDs:   segs,  // Hint: which segments to apply delete
+            }
+            s.stream.Append(deleteMsg)
+        }
+        // Note: For growing segments, timestamp-based dedup happens at query time
+    }
+
+    return s.stream.Append(msg)  // Forward insert
+}
+```
+
+**Key Properties:**
+1. **Consistent:** Sequential processing per shard eliminates race conditions
+2. **Efficient:** No extra network hop (PK index is local in StreamingNode)
+3. **Transparent:** Clients unaware of automatic deduplication
+4. **Configurable:** Can be enabled/disabled per collection
+
+#### Delete Injection Details
+
+**Timestamp Handling:**
+- Delete message uses **same timestamp** as insert message
+- Per Milvus semantics: `insertTs == deleteTs` means insert survives (see `entity_filter.go:85-87`)
+- This matches current upsert behavior
+
+**Segment Targeting:**
+- PK index returns: `[SegmentID1, SegmentID2, ...]` containing the PK
+- Delete message includes segment IDs as **hint** for efficient delta application
+- Delete buffer (L0 segments) will store `[PK, deleteTimestamp]` pairs
+
+**Growing Segment Handling:**
+- PK index only covers **sealed segments**
+- Growing segments continue using bloom filter + timestamp-based dedup at query time
+- This is consistent with lazy deduplication model
+
+#### Integration with Current System
+
+**Comparison with Explicit Upsert:**
+
+| Aspect | Explicit Upsert (Current) | Auto-dedup Insert (New) |
+|--------|---------------------------|-------------------------|
+| **Check location** | Proxy (via BF scan) | StreamingNode (via PK index) |
+| **Consistency** | No race protection | Sequential processing |
+| **Performance** | Expensive (BF scan all segments) | O(1) PK index lookup |
+| **Sealed segments** | Proxy queries all | StreamingNode checks index |
+| **Growing segments** | Proxy queries via BF | Relies on query-time dedup |
+
+**Result:** Auto-dedup inserts behave like upserts but more efficiently.
+
+#### Configuration
+
+```yaml
+pk_index:
+  auto_dedup_on_insert: true  # Default: true when PK index enabled
+
+  # Per-collection override
+  collection_config:
+    - collection_name: "high_throughput_logs"
+      auto_dedup_on_insert: false  # Disable for append-only workloads
+```
+
+**When to disable:**
+- Append-only workloads (no duplicate PKs expected)
+- Extreme write throughput requirements (skip dedup check overhead)
+- Temporary bulk import (will be deduplicated during compaction)
+
+#### Limitations and Trade-offs
+
+**What This Solves:**
+- ✅ Eliminates duplicate inserts to sealed segments
+- ✅ No race conditions (serialized processing)
+- ✅ Efficient (O(1) lookup vs. O(n) bloom filter scan)
+
+**What This Doesn't Solve:**
+- ❌ Duplicates within growing segments (still rely on query-time + compaction dedup)
+- ❌ Same-batch duplicates (Proxy still checks with `CheckDuplicatePkExist`)
+
+**Rationale:**
+- Growing segment deduplication would require mutable index (complex, memory-intensive)
+- Query-time + compaction-time dedup already handles this case efficiently
+- 90%+ of data is in sealed segments at steady state
+
 ## 4. Data Structures and Storage
 
 ### 4.1 BBHash Index Structure
@@ -321,27 +490,60 @@ Client → Proxy → StreamingNode (PK Lookup)
 
 ### 5.2 Upsert Operation
 
+**With Auto-Dedup Enabled (Recommended):**
+
+Regular inserts automatically behave like upserts (see Section 3.4):
+
 ```
-Client → Proxy → StreamingNode (PK Lookup for deduplication)
-                      ├─> Check if PK exists (BBHash + BF)
-                      └─> Return existing segment locations
+Client → Proxy → Streaming Service
+                      ↓
+            StreamingNode: Automatic deduplication
+                      ├─> Query PK index (sealed segments)
+                      ├─> If PK exists: Inject DeleteMsg
+                      └─> Forward InsertMsg
                  ↓
-            DataNode: Process upsert
-                      ├─> If exists: Issue delete to old locations
-                      └─> Insert new version
-                 ↓
-            Update growing segment BF
+            DataNode: Process messages
+                      ├─> Delete (if injected)
+                      └─> Insert
 ```
 
-**Steps:**
+**Explicit Upsert API (Fallback/Compatibility):**
+
+For clients that prefer explicit upsert semantics or when auto-dedup disabled:
+
+```
+Client → Proxy (Explicit Upsert)
+    ↓
+Proxy: Query StreamingNode for PK existence
+    ├─> BBHash lookup (sealed)
+    └─> BF lookup (growing)
+    ↓
+Proxy: Pack DeleteMsg + InsertMsg
+    ↓
+Streaming Service → StreamingNode → DataNode
+```
+
+**Steps (Explicit Upsert):**
 1. Proxy receives upsert request
 2. Proxy queries StreamingNode to check if PK exists
 3. StreamingNode returns segment locations (sealed + growing)
-4. DataNode processes:
-   - If PK exists: Mark old versions as deleted (delta operations)
-   - Insert new version into growing segment
-5. Update growing segment bloom filter
-6. Return success to client
+4. Proxy packs:
+   - DeleteMsg if PK exists (with segment hints)
+   - InsertMsg for new version
+5. Both messages sent to streaming service
+6. DataNode processes both messages
+
+**Key Difference:**
+- **Auto-dedup:** StreamingNode checks and injects delete transparently
+- **Explicit upsert:** Proxy checks and packs delete explicitly
+
+**Performance Comparison:**
+| Approach | Sealed Segment Check | Growing Segment Check | Network Hops |
+|----------|---------------------|----------------------|--------------|
+| Auto-dedup Insert | O(1) PK index in StreamingNode | Query-time dedup | 1 (client → proxy → stream) |
+| Explicit Upsert | O(1) PK index query | O(n) BF scan | 2 (client → proxy → stream, proxy → StreamingNode) |
+
+**Recommendation:** Use auto-dedup inserts for better performance and consistency.
 
 ### 5.3 Delete Operation
 
