@@ -203,14 +203,32 @@ T=3000: 收到 CommitImportMessage → Completed（数据可见）
 
 #### 解决时间戳语义问题
 
-我们引入 **segment 级的 `visible_timestamp` 元数据**：
+我们引入 **segment 级的 `visible_timestamp` 元数据**，作为**系统级的逻辑时间戳**：
 
 ```protobuf
 message SegmentInfo {
     // ... 现有字段 ...
 
-    // visible_timestamp 覆盖行级时间戳用于 DML 过滤
-    // 当设置时，QueryNode 使用此时间戳而非 row.timestamp
+    // visible_timestamp: Segment 的逻辑时间戳（覆盖行级物理时间戳）
+    //
+    // 语义定义:
+    //   - row.timestamp      = 物理写入时间（binlog 中的原始时间戳）
+    //   - visible_timestamp  = 逻辑可见时间（数据的真实"存在时间"）
+    //
+    // 使用规则:
+    //   系统中任何涉及"时序判断"、"因果关系"、"数据可见性"的逻辑，
+    //   都应该使用 visible_timestamp（如果设置）而非 row.timestamp
+    //
+    // 影响范围:
+    //   - QueryNode: DML 过滤、时间旅行查询、一致性快照
+    //   - DataCoord: Compaction 触发、Segment 时间范围管理、GC 决策
+    //   - CDC/Replication: Checkpoint 计算、复制进度判断
+    //   - 监控/诊断: Segment 时间范围显示、延迟统计
+    //
+    // 生命周期:
+    //   - 为 0: 正常 segment，使用 row.timestamp
+    //   - 非 0: import segment，使用 visible_timestamp 作为逻辑时间
+    //   - Compaction 重写 row.timestamp 后清除（设为 0）
     optional uint64 visible_timestamp = X;
 }
 ```
@@ -218,51 +236,102 @@ message SegmentInfo {
 **工作原理:**
 
 ```
-T=1000: Import 开始，行写入 binlog，row.timestamp = 1000
+T=1000: Import 开始，行写入 binlog，row.timestamp = 1000（物理时间）
         → Segment 处于 WaitingCommit，importing=true
+        → segment.visible_timestamp = 0（逻辑时间未设置）
 
 T=2000: DELETE pk=2, delete.timestamp = 2000
         → QueryNode 看不到隐藏的 segment，DELETE 不应用
 
 T=3000: CommitImport 广播，广播时间戳 T_commit = 3000
-        → DataCoord 设置: segment.visible_timestamp = 3000
+        → DataCoord 设置: segment.visible_timestamp = 3000（逻辑时间）
         → Segment 变为可查询: importing=false
 
 T=4000: 用户查询 pk=2
-        → QueryNode 过滤逻辑:
-            if segment.visible_timestamp != 0:
-                effective_ts = segment.visible_timestamp  # 使用 3000
-            else:
-                effective_ts = row.timestamp
+        → 系统统一使用逻辑时间:
+            effective_ts = segment.visible_timestamp ?: row.timestamp
+            effective_ts = 3000（使用逻辑时间）
 
         → DELETE 检查: effective_ts (3000) > delete.ts (2000)
         → 结论: DELETE 不生效，pk=2 可见
 ```
 
 **语义修正:**
-- Import 数据的"逻辑出现时间"是 T_commit（3000），而不是 T_import（1000）
-- T_commit 之前的 DML 操作（T=2000 的 DELETE）不应该影响 import 数据
+- Import 数据的**物理写入时间** = T_import（1000）→ 存储在 binlog 中
+- Import 数据的**逻辑存在时间** = T_commit（3000）→ 存储在 segment 元数据中
+- 系统所有时序判断使用**逻辑时间**，确保语义正确
+- T_commit 之前的 DML 操作（T=2000 的 DELETE）不影响 import 数据
 - T_commit 之后的 DML 操作才会正确应用
+
+**系统级影响:**
+
+| 组件 | 使用场景 | 行为变化 |
+|------|----------|----------|
+| **QueryNode** | DML 过滤、时间旅行查询 | 使用 `visible_timestamp` 判断行的逻辑存在时间 |
+| **DataCoord** | Compaction 决策、Segment 管理 | 使用 `visible_timestamp` 确定 segment 的逻辑时间范围 |
+| **CDC** | Checkpoint 计算、复制进度 | 使用 `visible_timestamp` 判断数据是否"逻辑提交" |
+| **Monitoring** | 时间范围展示、延迟统计 | 显示 `visible_timestamp` 作为 segment 的逻辑时间 |
 
 #### 跨集群一致性
 
-由于所有集群使用相同的 `visible_timestamp`（来自同一个 CommitImportMessage 广播），因此过滤逻辑是一致的：
+**关键机制：统一的逻辑时间基准**
+
+由于所有集群从同一个 `CommitImportMessage` 广播设置相同的 `visible_timestamp`，因此建立了**统一的逻辑时间基准**，消除了物理执行顺序的差异：
 
 ```
 主集群:
-T=1000: Import, row.ts = 1000
+T=1000: Import, row.ts = 1000（物理时间）
 T=2000: DELETE pk=2, delete.ts = 2000
-T=3000: CommitImport, segment.visible_timestamp = 3000
-→ 过滤: effective_ts (3000) > delete.ts (2000) → pk=2 可见
+T=3000: CommitImport, segment.visible_timestamp = 3000（逻辑时间）
+→ 系统时序判断: effective_ts (3000) > delete.ts (2000) → pk=2 可见
 
 从集群:
-T=1200: Import, row.ts = 1000
-T=3000: CommitImport, segment.visible_timestamp = 3000
+T=1200: Import, row.ts = 1000（物理时间）
+T=3000: CommitImport, segment.visible_timestamp = 3000（逻辑时间，与主集群相同）
 T=3100: CDC 收到 DELETE, delete.ts = 2000
-→ 过滤: effective_ts (3000) > delete.ts (2000) → pk=2 可见
+→ 系统时序判断: effective_ts (3000) > delete.ts (2000) → pk=2 可见
 
-结果: 主备行为一致！
+结果: 主备行为一致！✓
 ```
+
+**为什么能保证一致性？**
+
+1. **统一的逻辑时间戳**
+   - 所有集群的 `segment.visible_timestamp = T_commit`（来自同一广播）
+   - 无论物理执行顺序如何，逻辑时间统一
+
+2. **统一的时序判断规则**
+   - 所有组件都使用 `effective_ts = visible_timestamp ?: row.timestamp`
+   - DML 操作的应用与否仅取决于逻辑时间比较
+
+3. **与物理顺序无关**
+   - 即使主集群 Compaction 在 Import 完成后触发
+   - 即使从集群 Compaction 在 Import 完成前触发
+   - 由于都使用逻辑时间判断，结果一致
+
+**对比：如果没有 visible_timestamp**
+
+```
+主集群:
+T=50000: Import 完成，row.ts = 1000
+T=51000: Compaction 触发
+         → DELETE (ts=2000) vs row (ts=1000)
+         → 1000 < 2000 → DELETE 应用 → pk=2 被删除 ✓
+
+从集群:
+T=60000: Compaction 触发（Import 还未完成）
+         → Import segment 不参与 compaction
+T=61000: Import 完成，row.ts = 1000
+         → DELETE (ts=2000) 已经应用过
+         → 但 Import segment 不受影响 → pk=2 存在 ✗
+
+结果: 主备不一致！
+```
+
+**visible_timestamp 解决的本质问题：**
+- 将"物理时间"与"逻辑时间"解耦
+- 让系统的时序判断不再依赖不可控的物理执行顺序（如 Compaction 触发时机）
+- 通过统一的逻辑时间戳，建立跨集群的一致性基准
 
 ### 3.3 高层流程图
 
@@ -356,7 +425,16 @@ Pending → PreImporting → Importing → Sorting → IndexBuilding → Waiting
 | **退出条件** | • 收到 `CommitImportMessage` → `Completed`<br>• 收到 `AbortImportMessage` → `Failed`<br>• 超时（默认 1 小时）→ `Failed` 并自动清理 |
 | **提交触发** | • 非复制集群: 自动广播（向后兼容）<br>• 复制集群: 等待用户调用 `CommitImport` RPC |
 
-### 4.2 Segment 元数据扩展
+### 4.2 Segment 元数据扩展：逻辑时间戳
+
+**设计原则:**
+
+Milvus 引入**两层时间戳系统**来正确处理 Import 数据的时序语义：
+
+| 时间戳类型 | 存储位置 | 语义 | 使用场景 |
+|-----------|---------|------|----------|
+| **物理时间戳**<br>`row.timestamp` | Binlog 中的每一行 | 数据写入存储的物理时间 | Compaction 重写、物理存储 |
+| **逻辑时间戳**<br>`segment.visible_timestamp` | Segment 元数据 | 数据的逻辑可见时间 | 所有时序判断、DML 过滤、CDC |
 
 **SegmentInfo 新增字段:**
 
@@ -364,29 +442,102 @@ Pending → PreImporting → Importing → Sorting → IndexBuilding → Waiting
 message SegmentInfo {
     // ... 现有字段 ...
 
-    // visible_timestamp 覆盖行级时间戳用于 DML 过滤
-    // 用于 import segment 以确保 DML 操作遵循逻辑可见性顺序
+    // visible_timestamp: Segment 的逻辑时间戳（系统级时序语义）
     //
-    // 当设置（非零）时:
-    // - QueryNode 使用此时间戳进行过滤而非 row.timestamp
-    // - 确保 visible_timestamp 之前的 DML 不影响此 segment
-    // - 确保 visible_timestamp 之后的 DML 正确应用
+    // 【核心概念】
+    // 这不是 QueryNode 的实现细节，而是系统级的时序语义：
+    //   - row.timestamp      = 物理写入时间（binlog 中不变）
+    //   - visible_timestamp  = 逻辑可见时间（系统时序基准）
     //
-    // 当为零时:
-    // - 正常 segment（非 import），使用 row.timestamp 进行过滤
+    // 【使用规则】
+    // 系统中任何涉及以下判断的逻辑，都必须使用 visible_timestamp（如果非零）：
+    //   1. 时序比较：数据是否在某个时间点"存在"
+    //   2. 因果关系：操作 A 是否发生在操作 B 之前/之后
+    //   3. 一致性：跨集群的时间戳一致性判断
+    //   4. 过滤逻辑：DML 是否应该影响某行数据
     //
-    // 生命周期:
-    // - 接收 CommitImportMessage 时设置为 T_commit
-    // - Compaction 重写行时间戳后清除（设为 0）
+    // 【影响的组件】（必须使用 visible_timestamp）
+    //   - QueryNode:
+    //       * DML 过滤（DELETE/UPDATE 是否应用）
+    //       * 时间旅行查询（GuaranteeTimestamp 过滤）
+    //       * 一致性快照（ServiceTimestamp 过滤）
+    //   - DataCoord:
+    //       * Segment 时间范围管理（min/max timestamp）
+    //       * Compaction 触发条件（segment 是否可 compact）
+    //       * GC 决策（segment 是否可删除）
+    //   - CDC/Replication:
+    //       * Checkpoint 计算（复制进度判断）
+    //       * 复制延迟统计（数据同步进度）
+    //   - 监控/诊断:
+    //       * Segment 时间范围展示
+    //       * 数据延迟统计
+    //       * 时序一致性检查
+    //
+    // 【生命周期】
+    //   1. Import 阶段:
+    //      - visible_timestamp = 0
+    //      - importing = true
+    //      - 系统回退使用 row.timestamp（但数据不可见）
+    //
+    //   2. Commit 阶段:
+    //      - visible_timestamp = T_commit（CommitImportMessage 的时间戳）
+    //      - importing = false
+    //      - 系统使用 visible_timestamp 作为逻辑时间
+    //
+    //   3. Compaction 阶段:
+    //      - Compaction 重写每行的 row.timestamp = visible_timestamp
+    //      - 完成后清除: visible_timestamp = 0
+    //      - 系统回归正常：物理时间 = 逻辑时间
+    //
+    // 【重要说明】
+    //   - visible_timestamp = 0: 表示物理时间即逻辑时间（正常 segment）
+    //   - visible_timestamp != 0: 表示逻辑时间覆盖物理时间（import segment）
+    //   - 物理时间用于存储层，逻辑时间用于语义层
     optional uint64 visible_timestamp = X;
 }
 ```
 
 **工作流程:**
 
-1. **Import 阶段**: `visible_timestamp = 0`, `importing = true`（数据不可查询）
-2. **Commit 阶段**: `visible_timestamp = T_commit`, `importing = false`（数据可查询，使用覆盖时间戳）
-3. **Compaction 阶段**: 重写 `row.timestamp = visible_timestamp`, 然后 `visible_timestamp = 0`（数据标准化）
+```
+阶段 1: Import 执行
+  - row.timestamp = T_import（写入 binlog）
+  - segment.visible_timestamp = 0（未设置）
+  - segment.importing = true（不可查询）
+  → 系统行为：数据物理存在，但逻辑不可见
+
+阶段 2: Commit 提交
+  - segment.visible_timestamp = T_commit（设置逻辑时间）
+  - segment.importing = false（可查询）
+  - row.timestamp 保持 T_import（物理时间不变）
+  → 系统行为：所有时序判断使用 T_commit 作为基准
+
+阶段 3: Compaction 标准化
+  - 重写 binlog: row.timestamp ← segment.visible_timestamp
+  - 清除元数据: segment.visible_timestamp = 0
+  → 系统行为：物理时间与逻辑时间统一，回归正常
+```
+
+**示例：effective_timestamp 计算**
+
+所有组件应该使用统一的逻辑：
+
+```go
+// 获取 segment 中某行数据的有效时间戳（逻辑时间）
+func GetEffectiveTimestamp(segment *SegmentInfo, rowTimestamp uint64) uint64 {
+    if segment.VisibleTimestamp != 0 {
+        // Import segment: 使用逻辑时间
+        return segment.VisibleTimestamp
+    }
+    // 正常 segment: 使用物理时间
+    return rowTimestamp
+}
+
+// 应用场景示例:
+// - QueryNode: DELETE 过滤时判断 effectiveTs <= deleteTs
+// - DataCoord: 判断 segment 是否超过 retention period
+// - CDC: 判断数据是否已经"逻辑提交"
+```
 
 ### 4.3 新增消息类型
 
@@ -416,12 +567,19 @@ message AbortImportMsg {
 
 | 组件 | 改造内容 | 复杂度 |
 |------|----------|--------|
-| **DataCoord** | • 新增 WaitingCommit 状态处理<br>• 实现 CommitImport/AbortImport RPC<br>• 自动提交逻辑（非复制集群）<br>• Segment visible_timestamp 更新 | 中 |
-| **QueryNode** | • DML 过滤逻辑使用 effective_timestamp<br>• 支持 segment.visible_timestamp 覆盖 | 中 |
+| **Meta 存储**<br>（核心改造） | • SegmentInfo proto 新增 `visible_timestamp` 字段<br>• 引入两层时间戳系统（物理 + 逻辑）<br>• UpdateSegmentVisibility 方法 | 低 |
+| **DataCoord** | • 新增 WaitingCommit 状态处理<br>• 实现 CommitImport/AbortImport RPC<br>• 自动提交逻辑（非复制集群）<br>• Commit 时设置 segment.visible_timestamp<br>• Compaction 决策使用 visible_timestamp<br>• Segment 时间范围管理使用 visible_timestamp | 中 |
+| **QueryNode** | • DML 过滤逻辑使用 effective_timestamp (visible_timestamp ?: row.timestamp)<br>• 时间旅行查询使用 effective_timestamp<br>• 一致性快照使用 effective_timestamp | 中 |
 | **ImportChecker** | • WaitingCommit 状态检查和超时处理<br>• 自动提交判断逻辑 | 低 |
-| **Meta 存储** | • SegmentInfo proto 新增 visible_timestamp 字段<br>• UpdateSegmentVisibility 方法 | 低 |
-| **Compaction** | • 标准化 import segment 时间戳<br>• 清除 visible_timestamp 元数据 | 低 |
+| **Compaction** | • 标准化 import segment 时间戳（重写 row.timestamp）<br>• 清除 visible_timestamp 元数据（设为 0） | 低 |
+| **CDC/Replication** | • Checkpoint 计算使用 visible_timestamp<br>• 复制进度判断使用 visible_timestamp | 低 |
+| **Monitoring** | • Segment 时间范围展示使用 visible_timestamp<br>• 延迟统计使用 visible_timestamp | 低 |
 | **Proto 定义** | • 新增消息类型<br>• 新增 RPC 定义<br>• 状态枚举扩展 | 低 |
+
+**核心原则：**
+- `visible_timestamp` 是**系统级的逻辑时间戳**，不是某个组件的实现细节
+- 所有涉及"时序判断"、"因果关系"、"数据可见性"的逻辑都必须使用它
+- 物理时间戳（`row.timestamp`）仅用于存储层（binlog 读写、Compaction 重写）
 
 ### 4.5 向后兼容性
 
