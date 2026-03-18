@@ -786,6 +786,517 @@ After compaction:
 
 ---
 
+## Multi-vChannel Commit Consistency
+
+### Problem Statement
+
+When an import job spans multiple vchannels (common for partitioned collections), the `CommitImportMessage` must be broadcast to all vchannels to make imported data visible. This raises critical consistency questions:
+
+1. **Atomicity**: How do we guarantee that all vchannels commit atomically?
+2. **Broadcast coordination**: Does each vchannel process independently, or must we wait for all vchannels to acknowledge?
+3. **Broadcast location**: Where does the broadcast happen - DDL callback in DataCoord or StreamingNode flusher/flowgraph?
+4. **DML blocking**: Must all vchannels wait for `CommitImportMessage` before continuing to consume DML operations?
+
+**Failure scenario if not handled correctly:**
+```
+T0: CommitImport RPC called, broadcasts to vchannels [v1, v2, v3]
+T1: vchannel v1 processes CommitImportMessage → marks job Completed
+T2: vchannel v2 still processing (slow network/overload)
+T3: Query hits v1 (sees imported data) and v2 (doesn't see imported data)
+    → Result: Partial data visibility, inconsistent query results ❌
+```
+
+### Approach A: Independent vChannel Processing ❌ BROKEN
+
+**Design:**
+Each vchannel processes `CommitImportMessage` independently. DataCoord broadcasts and immediately returns success.
+
+```go
+// DataCoord.CommitImport RPC
+func (s *Server) CommitImport(ctx context.Context, req *internalpb.CommitImportRequest) error {
+    job := s.meta.GetJob(req.JobID)
+    if job.State != ImportJobStateV2_WaitingCommit {
+        return merr.WrapErr("job not in WaitingCommit state")
+    }
+
+    // Broadcast to all vchannels (fire and forget)
+    for _, vchannel := range job.GetVchannels() {
+        msg := message.NewCommitImportMessageBuilderV1().
+            WithJobID(req.JobID).
+            WithCommitTimestamp(req.CommitTimestamp).
+            BuildBroadcast()
+
+        s.broadcaster.BroadcastToChannel(ctx, vchannel, msg)
+    }
+
+    // Immediately transition to Completed (WRONG!)
+    s.meta.UpdateJobState(req.JobID, ImportJobStateV2_Completed)
+    return merr.Success()
+}
+```
+
+**Problems:**
+1. **Partial visibility**: First vchannel that processes the message marks job as `Completed`, but other vchannels may still be in `WaitingCommit`
+2. **Query inconsistency**: Queries see different data depending on which vchannel they hit
+3. **Cross-cluster divergence**: In replication scenarios, primary and secondary clusters can have different visible data
+
+**Verdict:** ❌ **Broken - Do not use**
+
+---
+
+### Approach B: Blocking Wait for All vChannels ✅ CORRECT (but blocks RPC)
+
+**Design:**
+DataCoord waits for all vchannels to acknowledge `CommitImportMessage` before returning from the RPC. Job transitions to `Completed` only after all vchannels confirm.
+
+```go
+// DataCoord.CommitImport RPC (blocking version)
+func (s *Server) CommitImport(ctx context.Context, req *internalpb.CommitImportRequest) error {
+    job := s.meta.GetJob(req.JobID)
+    if job.State != ImportJobStateV2_WaitingCommit {
+        return merr.WrapErr("job not in WaitingCommit state")
+    }
+
+    // Initialize commit tracking
+    commitStatus := make(map[string]bool)
+    for _, vchan := range job.Vchannels {
+        commitStatus[vchan] = false
+    }
+    s.meta.InitCommitTracking(req.JobID, commitStatus)
+
+    // Broadcast CommitImportMessage to all vchannels
+    err := s.broadcastCommitImport(ctx, req.JobID, job.Vchannels, req.CommitTimestamp)
+    if err != nil {
+        return errors.Wrap(err, "failed to broadcast commit")
+    }
+
+    // Wait for all vchannels to acknowledge (BLOCKING)
+    timeout := time.After(30 * time.Second)
+    ticker := time.NewTicker(100 * time.Millisecond)
+    defer ticker.Stop()
+
+    for {
+        select {
+        case <-timeout:
+            s.meta.UpdateJobState(req.JobID, ImportJobStateV2_Failed)
+            return merr.WrapErrImportFailed("commit timeout: not all vchannels acknowledged")
+
+        case <-ticker.C:
+            if s.meta.AllVChannelsCommitted(req.JobID) {
+                s.meta.UpdateJobState(req.JobID, ImportJobStateV2_Completed)
+                return merr.Success()
+            }
+        }
+    }
+}
+
+// Called by commitImportAckCallback when each vchannel processes the message
+func (m *meta) MarkVChannelCommitted(jobID int64, vchannel string) {
+    m.mu.Lock()
+    defer m.mu.Unlock()
+
+    if tracking, ok := m.commitTracking[jobID]; ok {
+        tracking.VChannelStatus[vchannel] = true
+    }
+}
+
+func (m *meta) AllVChannelsCommitted(jobID int64) bool {
+    m.mu.RLock()
+    defer m.mu.RUnlock()
+
+    tracking, ok := m.commitTracking[jobID]
+    if !ok {
+        return false
+    }
+
+    for _, committed := range tracking.VChannelStatus {
+        if !committed {
+            return false
+        }
+    }
+    return true
+}
+```
+
+**Timing diagram:**
+```
+T0: CommitImport RPC called
+    ├─ Broadcast to vchannels [v1, v2, v3]
+    └─ Enter blocking wait loop
+
+T1: vchannel v1 processes CommitImportMessage
+    └─ Calls MarkVChannelCommitted(jobID, "v1")
+    └─ commitStatus = {v1: true, v2: false, v3: false}
+
+T2: vchannel v2 processes CommitImportMessage
+    └─ Calls MarkVChannelCommitted(jobID, "v2")
+    └─ commitStatus = {v1: true, v2: true, v3: false}
+
+T3: vchannel v3 processes CommitImportMessage
+    └─ Calls MarkVChannelCommitted(jobID, "v3")
+    └─ commitStatus = {v1: true, v2: true, v3: true}
+    └─ AllVChannelsCommitted() == true
+    └─ CommitImport RPC returns success ✅
+```
+
+**Advantages:**
+- ✅ **Strong consistency**: Job only transitions to `Completed` after ALL vchannels commit
+- ✅ **Atomic visibility**: All vchannels see imported data at the same logical time
+- ✅ **Simple to understand**: Clear blocking semantics
+
+**Disadvantages:**
+- ❌ **Blocks RPC**: CommitImport RPC can take 5-30 seconds depending on vchannel count and load
+- ❌ **Client timeout risk**: Long-running RPCs can hit client/proxy timeout limits
+- ❌ **Resource usage**: Holds goroutine and connection during wait
+
+**Verdict:** ✅ **Correct but not optimal** - Use only if blocking is acceptable
+
+---
+
+### Approach C: Async Wait with Committing State ⭐ RECOMMENDED
+
+**Design:**
+Introduce a new `Committing` state between `WaitingCommit` and `Completed`. CommitImport RPC returns immediately after initiating the broadcast. A background checker monitors progress and transitions to `Completed` when all vchannels acknowledge.
+
+#### Proto Changes
+
+```protobuf
+// pkg/proto/data_coord.proto
+enum ImportJobStateV2 {
+    None = 0;
+    Pending = 1;
+    PreImporting = 2;
+    Importing = 3;
+    IndexBuilding = 4;
+    WaitingCommit = 8;
+    Committing = 9;     // NEW STATE
+    Completed = 10;
+    Failed = 11;
+    Aborted = 12;
+}
+
+message CommitTrackingInfo {
+    int64 job_id = 1;
+    map<string, bool> vchannel_status = 2;  // vchannel -> committed
+    uint64 commit_start_time = 3;           // Timestamp when commit started
+}
+```
+
+#### Implementation
+
+```go
+// DataCoord.CommitImport RPC (non-blocking version)
+func (s *Server) CommitImport(ctx context.Context, req *internalpb.CommitImportRequest) (*commonpb.Status, error) {
+    job := s.meta.GetJob(req.JobID)
+    if job.State != ImportJobStateV2_WaitingCommit {
+        return merr.Status(merr.WrapErr("job not in WaitingCommit state")), nil
+    }
+
+    // 1. Initialize commit tracking
+    commitStatus := make(map[string]bool)
+    for _, vchan := range job.Vchannels {
+        commitStatus[vchan] = false
+    }
+
+    // 2. Transition to Committing state (atomic with tracking initialization)
+    err := s.meta.TransitionToCommitting(req.JobID, commitStatus)
+    if err != nil {
+        return merr.Status(err), nil
+    }
+
+    // 3. Broadcast CommitImportMessage to all vchannels
+    err = s.broadcastCommitImport(ctx, req.JobID, job.Vchannels, req.CommitTimestamp)
+    if err != nil {
+        s.meta.UpdateJobState(req.JobID, ImportJobStateV2_Failed)
+        return merr.Status(errors.Wrap(err, "failed to broadcast commit")), nil
+    }
+
+    // 4. Return immediately (non-blocking)
+    log.Info("commit initiated, transitioning to Committing state",
+        zap.Int64("jobID", req.JobID),
+        zap.Strings("vchannels", job.Vchannels))
+
+    return merr.Success(), nil
+}
+
+// Background checker (runs every 1 second in importChecker loop)
+func (c *importChecker) checkCommittingJobs() {
+    jobs := c.meta.GetJobsByState(ImportJobStateV2_Committing)
+
+    for _, job := range jobs {
+        // Check if all vchannels have committed
+        if c.meta.AllVChannelsCommitted(job.JobID) {
+            log.Info("all vchannels committed, transitioning to Completed",
+                zap.Int64("jobID", job.JobID),
+                zap.Int("vchannelCount", len(job.Vchannels)))
+
+            c.meta.UpdateJobState(job.JobID, ImportJobStateV2_Completed)
+            c.meta.CleanupCommitTracking(job.JobID)
+            continue
+        }
+
+        // Check for timeout (5 minutes default)
+        tracking := c.meta.GetCommitTracking(job.JobID)
+        if time.Since(time.UnixMilli(int64(tracking.CommitStartTime))) > 5*time.Minute {
+            log.Error("commit timeout exceeded, marking job as Failed",
+                zap.Int64("jobID", job.JobID),
+                zap.Any("vchannelStatus", tracking.VChannelStatus))
+
+            c.meta.UpdateJobState(job.JobID, ImportJobStateV2_Failed)
+            c.meta.CleanupCommitTracking(job.JobID)
+        }
+    }
+}
+
+// Meta operations
+func (m *meta) TransitionToCommitting(jobID int64, vchannelStatus map[string]bool) error {
+    m.mu.Lock()
+    defer m.mu.Unlock()
+
+    job, ok := m.jobs[jobID]
+    if !ok {
+        return merr.WrapErrImportFailed("job not found")
+    }
+
+    if job.State != ImportJobStateV2_WaitingCommit {
+        return merr.WrapErrImportFailed("job not in WaitingCommit state")
+    }
+
+    // Atomic state transition + tracking initialization
+    job.State = ImportJobStateV2_Committing
+    m.commitTracking[jobID] = &CommitTrackingInfo{
+        JobID:           jobID,
+        VChannelStatus:  vchannelStatus,
+        CommitStartTime: uint64(time.Now().UnixMilli()),
+    }
+
+    return m.catalog.SaveJob(job)
+}
+
+func (m *meta) MarkVChannelCommitted(jobID int64, vchannel string) {
+    m.mu.Lock()
+    defer m.mu.Unlock()
+
+    if tracking, ok := m.commitTracking[jobID]; ok {
+        tracking.VChannelStatus[vchannel] = true
+
+        log.Debug("vchannel committed",
+            zap.Int64("jobID", jobID),
+            zap.String("vchannel", vchannel),
+            zap.Any("status", tracking.VChannelStatus))
+    }
+}
+```
+
+#### User Experience
+
+```bash
+# User calls CommitImport
+curl -X POST http://localhost:9091/api/v2/import/commit \
+  -d '{"jobId": "448293190903759186", "clusterId": "primary"}'
+
+# Response returns immediately (within 100ms)
+{
+  "code": 0,
+  "msg": "success",
+  "data": {
+    "jobId": "448293190903759186",
+    "state": "Committing"  # NEW STATE
+  }
+}
+
+# User polls GetImportProgress to monitor commit progress
+curl -X GET http://localhost:9091/api/v2/import/progress?jobId=448293190903759186
+
+# While committing (vchannels still processing)
+{
+  "jobId": "448293190903759186",
+  "state": "Committing",
+  "progress": 100,
+  "committedVChannels": ["v1", "v2"],      # NEW FIELD
+  "totalVChannels": ["v1", "v2", "v3"],    # NEW FIELD
+  "commitProgress": "2/3"                   # NEW FIELD
+}
+
+# After all vchannels committed (background checker transitions state)
+{
+  "jobId": "448293190903759186",
+  "state": "Completed",  # Automatically transitioned by checker
+  "progress": 100,
+  "committedVChannels": ["v1", "v2", "v3"],
+  "totalVChannels": ["v1", "v2", "v3"],
+  "commitProgress": "3/3"
+}
+```
+
+#### Timing Diagram
+
+```
+T0: CommitImport RPC called
+    ├─ InitCommitTracking(jobID, {v1: false, v2: false, v3: false})
+    ├─ TransitionToCommitting(jobID)
+    ├─ Broadcast to vchannels [v1, v2, v3]
+    └─ Return success immediately ✅
+
+T1: User polls GetImportProgress
+    └─ Response: {"state": "Committing", "commitProgress": "0/3"}
+
+T2: vchannel v1 processes CommitImportMessage
+    └─ commitImportAckCallback → MarkVChannelCommitted(jobID, "v1")
+    └─ commitStatus = {v1: true, v2: false, v3: false}
+
+T3: User polls GetImportProgress
+    └─ Response: {"state": "Committing", "commitProgress": "1/3"}
+
+T4: vchannel v2 processes CommitImportMessage
+    └─ commitImportAckCallback → MarkVChannelCommitted(jobID, "v2")
+    └─ commitStatus = {v1: true, v2: true, v3: false}
+
+T5: vchannel v3 processes CommitImportMessage
+    └─ commitImportAckCallback → MarkVChannelCommitted(jobID, "v3")
+    └─ commitStatus = {v1: true, v2: true, v3: true}
+
+T6: importChecker loop (runs every 1 second)
+    ├─ checkCommittingJobs()
+    ├─ AllVChannelsCommitted(jobID) == true
+    └─ UpdateJobState(jobID, Completed) ✅
+
+T7: User polls GetImportProgress
+    └─ Response: {"state": "Completed", "commitProgress": "3/3"}
+```
+
+**Advantages:**
+- ✅ **Non-blocking RPC**: CommitImport returns immediately (< 100ms)
+- ✅ **Strong consistency**: Job only transitions to `Completed` after all vchannels commit
+- ✅ **Observable progress**: User can monitor commit progress via GetImportProgress
+- ✅ **Timeout handling**: Background checker detects stuck commits and fails the job
+- ✅ **Scalable**: Works with any number of vchannels without holding connections
+
+**Disadvantages:**
+- ⚠️ **Slightly more complex**: Requires new state + background checker logic
+- ⚠️ **Proto changes**: Adds `Committing` state (but minimal impact, proto is versioned)
+
+**Verdict:** ⭐ **RECOMMENDED** - Best balance of correctness, usability, and scalability
+
+---
+
+### Broadcast Location: DDL Callback vs StreamingNode
+
+**Question:** Where does the `CommitImportMessage` broadcast happen?
+
+**Answer:** **DDL Callback in DataCoord** (`internal/datacoord/ddl_callbacks_import.go`)
+
+**Reasoning:**
+
+1. **CommitImport is a DataCoord RPC**: The user calls `DataCoord.CommitImport()`, not a StreamingNode API. The broadcast naturally belongs in the RPC handler.
+
+2. **Reuses existing broadcast infrastructure**: DataCoord already has `startBroadcastWithCollectionID()` and `broadcaster.Broadcast()` for ImportMessage. CommitImportMessage uses the same infrastructure.
+
+3. **StreamingNode role**: StreamingNode is a **passive consumer** of messages. It processes messages (via flusher/flowgraph) and invokes callbacks, but it doesn't initiate broadcasts. The broadcast is initiated by DataCoord.
+
+**Implementation flow:**
+
+```go
+// User calls CommitImport RPC → DataCoord
+User → DataCoord.CommitImport()
+
+// DataCoord broadcasts CommitImportMessage
+DataCoord → broadcastCommitImport()
+         → broadcaster.Broadcast(ctx, CommitImportMessage)
+         → StreamingNode (writes to WAL for each vchannel)
+
+// StreamingNode processes message via flowgraph
+StreamingNode → ReadWAL() → flowgraph → DDL callback
+            → DDLCallbacks.commitImportAckCallback()
+            → meta.MarkVChannelCommitted(jobID, vchannel)
+```
+
+**Code location:**
+- **Broadcast**: `internal/datacoord/ddl_callbacks_import.go:broadcastCommitImport()`
+- **Ack callback**: `internal/datacoord/ddl_callbacks_import.go:commitImportAckCallback()`
+
+---
+
+### DML Blocking: Must vChannels Wait for CommitImportMessage?
+
+**Question:** Do all vchannels need to wait for `CommitImportMessage` before continuing to consume DML operations?
+
+**Answer:** **NO, DML consumption does NOT need to block.**
+
+**Reasoning:**
+
+1. **Isolation via visible_timestamp**: Import segments have `visible_timestamp = T_commit`. Even if the segments exist on disk during `WaitingCommit` state, they are **invisible** to queries because:
+   - QueryNode filters segments based on `visible_timestamp`
+   - Only segments with `visible_timestamp <= query_timestamp` are included in results
+   - DML operations (INSERT/DELETE/UPSERT) continue normally without seeing hidden import segments
+
+2. **PK deduplication works correctly**: The import-pk-deduplication integration design (see `2026-03-17-import-pk-deduplication-integration.md`) ensures that:
+   - Importing PKs are pre-registered in the PK index **before** writing data
+   - StreamingNode deduplication checks `importingPKs` map during INSERT processing
+   - Conflicts are detected and resolved based on timestamp ordering (`rowTs <= T_import`)
+
+3. **No data corruption risk**: Import segments are immutable. DML operations create new segments (growing segments) that don't interfere with import segments.
+
+**Example scenario:**
+
+```
+T0: Import job in WaitingCommit state
+    └─ Import segments exist on disk with visible_timestamp = T_commit
+    └─ Import PKs registered in PK index (importingPKs map)
+
+T1: User inserts rows with PKs that overlap with import data
+    └─ StreamingNode checks PK index
+    └─ Finds PK in importingPKs[jobID] with ImportTimestamp = T_import
+    └─ Compares: Insert.rowTs vs T_import
+    └─ If Insert.rowTs > T_import: Insert succeeds (newer data wins)
+    └─ If Insert.rowTs <= T_import: Insert rejected (conflict with import)
+
+T2: User queries collection
+    └─ QueryNode filters segments: visible_timestamp <= query_timestamp
+    └─ Import segments NOT included (visible_timestamp = T_commit > query_timestamp)
+    └─ Query sees only DML data, not import data ✅
+
+T3: CommitImportMessage broadcast, job transitions to Completed
+    └─ UpdateSegmentVisibility(jobID, T_commit)
+    └─ Import segments now visible (visible_timestamp = T_commit)
+
+T4: Subsequent queries see both import data and DML data
+    └─ Consistent view across all vchannels
+```
+
+**Conclusion:** DML operations can proceed **concurrently** with commit processing. No blocking needed.
+
+---
+
+### Implementation Checklist Updates
+
+Add the following items to the implementation checklist:
+
+**Protocol Buffers:**
+- [ ] Add `Committing` state to `ImportJobStateV2` enum (value = 9)
+- [ ] Add `CommitTrackingInfo` message with vchannel status map
+- [ ] Add `committedVChannels`, `totalVChannels`, `commitProgress` fields to `GetImportProgressResponse`
+
+**DataCoord Implementation:**
+- [ ] Implement `TransitionToCommitting()` in `meta.go`
+- [ ] Implement `MarkVChannelCommitted()` in `meta.go`
+- [ ] Implement `AllVChannelsCommitted()` in `meta.go`
+- [ ] Implement `GetCommitTracking()` in `meta.go`
+- [ ] Implement `CleanupCommitTracking()` in `meta.go`
+- [ ] Add `checkCommittingJobs()` to `importChecker` loop
+- [ ] Update `GetImportProgress` RPC to include commit progress fields
+- [ ] Add commit timeout configuration (`dataCoord.import.commitTimeout`, default 5 minutes)
+
+**Testing:**
+- [ ] Unit test: multi-vchannel commit with all vchannels acknowledging
+- [ ] Unit test: multi-vchannel commit timeout (one vchannel stuck)
+- [ ] Unit test: concurrent DML during Committing state (no blocking)
+- [ ] Integration test: 10-vchannel import with staggered commit acknowledgments
+- [ ] Integration test: commit progress polling during Committing state
+- [ ] Chaos test: kill DataCoord during Committing state, verify recovery on restart
+
+---
+
 ## Outstanding Consistency Issues and Trade-offs
 
 ### Critical Issues Identified
