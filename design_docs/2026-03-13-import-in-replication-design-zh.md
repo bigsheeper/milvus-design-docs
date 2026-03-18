@@ -157,39 +157,26 @@ Import 在复制场景下的核心难点：
 
 ---
 
-## 三、解决方案：两阶段提交协议
+## 三、解决方案
 
-### 3.1 方案核心思想
+本方案通过引入两阶段提交协议（Two-Phase Commit Protocol）解决 Import 在复制场景下的数据一致性问题。核心机制包括新增 WaitingCommit 中间状态、commit_timestamp 逻辑时间戳元数据、以及 CommitImport/AbortImport RPC 接口，实现跨集群数据可见性的原子化控制。
 
-我们引入一个**手动两阶段提交协议**来解决上述问题：
+**核心设计思想：**
 
-**阶段 1: 准备阶段（Prepare）**
-- 各集群独立执行 Import 任务，完成数据物理写入和索引构建
-- Import 完成后，状态转换至 **WaitingCommit**
-- WaitingCommit 状态语义：数据已持久化到对象存储，但 `importing=true` 标记阻止查询可见
-- 各集群在此状态阻塞，等待外部提交信号
+Import 操作分解为 Prepare 和 Commit 两个阶段，在 Prepare 阶段各集群独立执行数据写入和索引构建，完成后进入 WaitingCommit 状态等待提交信号；在 Commit 阶段由平台侧显式调用 CommitImport RPC，通过 CDC 链路广播提交消息，各集群接收后原子地切换数据可见性。
 
-**阶段 2: 提交阶段（Commit）**
-- 平台侧通过 GetImportProgress API 轮询，确认所有集群达到 WaitingCommit
-- 在主集群调用 `CommitImport` RPC 触发提交
-- 主集群广播 `CommitImportMessage`，通过 CDC 链路传播至从集群
-- 各集群接收消息后，执行原子状态转换：
-  - 设置 `segment.commit_timestamp` 元数据
-  - 清除 `segment.importing` 标记
-  - Job 状态转换：WaitingCommit → Completed
+**架构特性：**
+- **状态解耦**：物理数据准备（Prepare）与逻辑数据可见（Commit）分离
+- **统一协调**：所有集群基于相同 JobID 和 commit_timestamp 实现跨集群一致性
+- **显式控制**：平台侧显式触发提交，无自动提交逻辑（复制场景下）
+- **CDC 传播**：复用现有 CDC 消息广播机制，CommitImportMessage 通过所有 vchannel 传播
+- **原子转换**：各集群本地状态转换为原子操作，无中间状态
 
-**关键特性:**
-- **统一 JobID**: 所有集群使用相同的 JobID，确保处理的是同一个导入任务
-- **手动协调**: 平台侧负责确认所有集群就绪后才提交（不自动验证）
-- **CDC 广播**: 利用现有 CDC 机制传播提交消息
-- **原子可见性**: 每个集群本地的状态转换是原子的
-- **多 VChannel 广播**: CommitImportMessage 和 AbortImportMessage 通过 collection 的所有 vchannel 广播，确保与 ImportMessage 一致的传播路径
+**方案如何解决一致性问题**
 
-### 3.2 方案如何解决一致性问题
+**(1) 时机同步问题的解决**
 
-#### 解决时机同步问题
-
-通过 WaitingCommit 状态，我们将"数据准备完成"和"数据可查询"两个时间点解耦：
+WaitingCommit 状态将数据物理准备完成与逻辑可见性解耦，消除了 CDC 延迟导致的主从集群 Import 完成时间差异：
 
 ```
 主集群:
@@ -204,42 +191,9 @@ T=3000: 收到 CommitImportMessage → Completed（数据可见）
 结果: 两个集群同时在 T=3000 让数据可查询
 ```
 
-#### 解决时间戳语义问题
+**(2) 时间戳语义问题的解决**
 
-我们引入 **segment 级的 `commit_timestamp` 元数据**，作为**系统级的逻辑时间戳**：
-
-```protobuf
-message SegmentInfo {
-    // ... 现有字段 ...
-
-    // commit_timestamp: Import 数据的提交时间戳（系统级时序语义）
-    //
-    // 语义定义:
-    //   - row.timestamp      = 物理写入时间（Import 执行时写入 binlog）
-    //   - commit_timestamp  = 提交时间（CommitImport 时设置，数据的逻辑存在时间）
-    //
-    // 命名动机:
-    //   直接对应 CommitImport 操作，表示两阶段提交中的 commit 时间点
-    //
-    // 使用规则:
-    //   系统中任何涉及"时序判断"、"因果关系"、"数据可见性"的逻辑，
-    //   都应该使用 commit_timestamp（如果设置）而非 row.timestamp
-    //
-    // 影响范围:
-    //   - QueryNode: DML 过滤、时间旅行查询、一致性快照
-    //   - DataCoord: Compaction 触发、Segment 时间范围管理、GC 决策
-    //   - CDC/Replication: Checkpoint 计算、复制进度判断
-    //   - 监控/诊断: Segment 时间范围显示、延迟统计
-    //
-    // 生命周期:
-    //   - 为 0: 正常 segment（未提交或已标准化）
-    //   - 非 0: import segment（已提交但未标准化）
-    //   - Compaction 重写 row.timestamp 后清除（设为 0）
-    optional uint64 commit_timestamp = X;
-}
-```
-
-**工作原理:**
+引入 segment 级的 `commit_timestamp` 元数据字段，作为系统级逻辑时间戳，与物理写入时间 `row.timestamp` 解耦。时间戳语义修正机制如下：
 
 ```
 T=1000: Import 开始，行写入 binlog，row.timestamp = 1000（物理时间）
@@ -262,27 +216,15 @@ T=4000: 用户查询 pk=2
         → 结论: DELETE 不生效，pk=2 可见
 ```
 
-**语义修正:**
-- Import 数据的**物理写入时间** = T_import（1000）→ 存储在 binlog 中
-- Import 数据的**逻辑存在时间** = T_commit（3000）→ 存储在 segment 元数据中
-- 系统所有时序判断使用**逻辑时间**，确保语义正确
-- T_commit 之前的 DML 操作（T=2000 的 DELETE）不影响 import 数据
-- T_commit 之后的 DML 操作才会正确应用
+- Import 数据的物理写入时间（`row.timestamp` = T_import）存储在 binlog，记录数据写入对象存储的时间点
+- Import 数据的逻辑存在时间（`segment.commit_timestamp` = T_commit）存储在元数据，记录数据提交可见的时间点
+- 系统所有时序判断、DML 过滤、因果关系分析统一使用逻辑时间，确保跨集群一致性
+- T_commit 之前的 DML 操作不影响 Import 数据（因逻辑上数据尚未存在）
+- T_commit 之后的 DML 操作按照正常时序规则应用
 
-**系统级影响:**
+**(3) 跨集群一致性保证**
 
-| 组件 | 使用场景 | 行为变化 |
-|------|----------|----------|
-| **QueryNode** | DML 过滤、时间旅行查询 | 使用 `commit_timestamp` 判断行的逻辑存在时间 |
-| **DataCoord** | Compaction 决策、Segment 管理 | 使用 `commit_timestamp` 确定 segment 的逻辑时间范围 |
-| **CDC** | Checkpoint 计算、复制进度 | 使用 `commit_timestamp` 判断数据是否"逻辑提交" |
-| **Monitoring** | 时间范围展示、延迟统计 | 显示 `commit_timestamp` 作为 segment 的逻辑时间 |
-
-#### 跨集群一致性
-
-**关键机制：统一的逻辑时间基准**
-
-由于所有集群从同一个 `CommitImportMessage` 广播设置相同的 `commit_timestamp`，因此建立了**统一的逻辑时间基准**，消除了物理执行顺序的差异：
+通过统一的逻辑时间基准消除物理执行顺序差异。所有集群从同一 CommitImportMessage 广播获取相同的 commit_timestamp，确保跨集群时序判断结果一致：
 
 ```
 主集群:
@@ -300,22 +242,7 @@ T=3100: CDC 收到 DELETE, delete.ts = 2000
 结果: 主备行为一致！✓
 ```
 
-**为什么能保证一致性？**
-
-1. **统一的逻辑时间戳**
-   - 所有集群的 `segment.commit_timestamp = T_commit`（来自同一广播）
-   - 无论物理执行顺序如何，逻辑时间统一
-
-2. **统一的时序判断规则**
-   - 所有组件都使用 `effective_ts = commit_timestamp ?: row.timestamp`
-   - DML 操作的应用与否仅取决于逻辑时间比较
-
-3. **与物理顺序无关**
-   - 即使主集群 Compaction 在 Import 完成后触发
-   - 即使从集群 Compaction 在 Import 完成前触发
-   - 由于都使用逻辑时间判断，结果一致
-
-**对比：如果没有 commit_timestamp**
+一致性保证的本质：所有集群使用相同的 commit_timestamp 作为逻辑时间基准，无论各集群的物理执行顺序（如 Compaction 触发时机）如何差异，基于逻辑时间的时序判断结果始终一致。对比方案（无 commit_timestamp）：
 
 ```
 主集群:
@@ -334,115 +261,38 @@ T=61000: Import 完成，row.ts = 1000
 结果: 主备不一致！
 ```
 
-**commit_timestamp 解决的本质问题：**
-- 将"物理时间"与"逻辑时间"解耦
-- 让系统的时序判断不再依赖不可控的物理执行顺序（如 Compaction 触发时机）
-- 通过统一的逻辑时间戳，建立跨集群的一致性基准
+commit_timestamp 解决的本质：通过逻辑时间与物理时间的解耦，使系统时序判断独立于不可控的物理执行顺序，建立跨集群一致性基准。
 
-### 3.3 高层流程图
+**状态机扩展**
 
-**复制集群（手动 Commit）:**
+ImportJob 状态机新增 WaitingCommit 中间状态，位于 IndexBuilding 和 Completed 之间：
 
 ```
-┌─────────────────────────────────────────────────────────────┐
-│                     主集群 (PRIMARY)                         │
-│  用户 → Proxy → DataCoord.ImportV2()                        │
-│         ↓                                                    │
-│  DataCoord 广播 ImportMessage (通过 CDC)                    │
-│         ↓                                                    │
-│  ImportJob: Pending → Importing → IndexBuilding            │
-│         ↓                                                    │
-│  进入新状态: WaitingCommit (数据已写入但不可查询)          │
-│         ↓                                                    │
-│  用户检查所有集群状态，确认都到达 WaitingCommit            │
-│         ↓                                                    │
-│  用户调用: CommitImport(jobID)                              │
-│         ↓                                                    │
-│  DataCoord 广播: CommitImportMessage (ts = T_commit)        │
-└─────────────────────────────────────────────────────────────┘
-                           │
-                           │ CDC 复制
-                           ↓
-┌─────────────────────────────────────────────────────────────┐
-│                   从集群 (SECONDARIES)                       │
-│  Proxy 接收 ImportMessage → DataCoord 处理                  │
-│         ↓                                                    │
-│  ImportJob: Pending → Importing → IndexBuilding            │
-│         ↓                                                    │
-│  进入: WaitingCommit (等待提交信号)                         │
-│         ↓                                                    │
-│  接收 CommitImportMessage (ts = T_commit)                   │
-│         ↓                                                    │
-│  原子操作:                                                   │
-│    - 设置 segment.commit_timestamp = T_commit              │
-│    - 设置 segment.importing = false                         │
-│    - 状态转换: WaitingCommit → Completed                    │
-└─────────────────────────────────────────────────────────────┘
-```
-
-**非复制集群（自动 Commit，向后兼容）:**
-
-```
-┌─────────────────────────────────────────────────────────────┐
-│                   非复制集群                                 │
-│  用户 → Proxy → DataCoord.ImportV2()                        │
-│         ↓                                                    │
-│  ImportJob: Pending → Importing → IndexBuilding            │
-│         ↓                                                    │
-│  进入: WaitingCommit                                        │
-│         ↓                                                    │
-│  DataCoord 自动广播 CommitImportMessage（无需用户干预）    │
-│         ↓                                                    │
-│  状态转换: WaitingCommit → Completed                        │
-│         ↓                                                    │
-│  结果: 用户看到 IndexBuilding → Completed（平滑过渡）      │
-└─────────────────────────────────────────────────────────────┘
-```
-
----
-
-## 四、方案改造
-
-### 4.1 状态机扩展
-
-**当前状态机 (8 个状态):**
-
-```
+原状态机 (8 状态):
 Pending → PreImporting → Importing → Sorting → IndexBuilding → Completed
-            ↓              ↓           ↓            ↓              ↓
-                             Failed (任意阶段)
-```
+           ↓              ↓           ↓            ↓              ↓
+                            Failed (任意阶段)
 
-**新状态机 (9 个状态):**
-
-```
+新状态机 (9 状态):
 Pending → PreImporting → Importing → Sorting → IndexBuilding → WaitingCommit → Completed
-            ↓              ↓           ↓            ↓               ↓              ↓
-                             Failed (任意阶段，或显式 abort)
+           ↓              ↓           ↓            ↓               ↓              ↓
+                            Failed (任意阶段，或显式 AbortImport)
 ```
 
-**新增状态: WaitingCommit**
+**WaitingCommit 状态语义：**
+- **进入条件**：IndexBuilding 完成，所有 Segment 已写入对象存储并完成索引构建
+- **状态特征**：Segment 标记 `importing=true`，查询不可见；Job 元数据持久化在 etcd
+- **退出条件**：接收 CommitImportMessage → Completed，或接收 AbortImportMessage → Failed
+- **触发机制**：复制集群等待平台侧调用 CommitImport RPC；非复制集群自动广播 CommitImportMessage
 
-| 属性 | 说明 |
-|------|------|
-| **用途** | 在使导入数据可查询之前的检查点，等待提交信号 |
-| **进入条件** | IndexBuilding 成功完成（所有集群统一） |
-| **状态特征** | • Segment 已写入存储<br>• Segment 已建立索引<br>• Segment 标记 `importing=true`（不可查询）<br>• Job 元数据持久化在 etcd |
-| **退出条件** | • 收到 `CommitImportMessage` → `Completed`<br>• 收到 `AbortImportMessage` → `Failed` |
-| **提交触发** | • 非复制集群: 自动广播（向后兼容）<br>• 复制集群: 等待用户调用 `CommitImport` RPC |
+**commit_timestamp 元数据字段**
 
-### 4.2 Segment 元数据扩展：逻辑时间戳
-
-**设计原则:**
-
-Milvus 引入**两层时间戳系统**来正确处理 Import 数据的时序语义：
+SegmentInfo proto 新增 `commit_timestamp` 字段，实现两层时间戳系统：
 
 | 时间戳类型 | 存储位置 | 语义 | 使用场景 |
 |-----------|---------|------|----------|
-| **物理时间戳**<br>`row.timestamp` | Binlog 中的每一行 | 数据写入存储的物理时间 | Compaction 重写、物理存储 |
-| **逻辑时间戳**<br>`segment.commit_timestamp` | Segment 元数据 | 数据的逻辑可见时间 | 所有时序判断、DML 过滤、CDC |
-
-**SegmentInfo 新增字段:**
+| `row.timestamp` | Binlog 行数据 | 数据写入对象存储的物理时间 | 物理存储、Compaction 重写 |
+| `segment.commit_timestamp` | SegmentInfo 元数据 | 数据逻辑可见的提交时间 | 时序判断、DML 过滤、CDC checkpoint |
 
 ```protobuf
 message SegmentInfo {
@@ -451,17 +301,9 @@ message SegmentInfo {
     // commit_timestamp: Segment 的提交时间戳（系统级时序语义）
     //
     // 【核心概念】
-    // 这不是 QueryNode 的实现细节，而是系统级的时序语义：
+    // 两层时间戳系统：
     //   - row.timestamp      = 物理写入时间（Import 执行时写入 binlog）
     //   - commit_timestamp  = 提交时间（CommitImport 时设置，表示数据的逻辑存在时间）
-    //
-    // 命名动机：
-    //   - "commit" 直接对应 CommitImport 操作（两阶段提交的 commit 阶段）
-    //   - 类似分布式事务中的 commit_ts，表示事务提交的时间点
-    //   - 与 WaitingCommit 状态形成完整的语义闭环：
-    //     * WaitingCommit: 准备阶段，数据已写入但未提交
-    //     * CommitImport: 提交操作
-    //     * commit_timestamp: 提交时间戳
     //
     // 【使用规则】
     // 系统中任何涉及以下判断的逻辑，都必须使用 commit_timestamp（如果非零）：
@@ -470,103 +312,38 @@ message SegmentInfo {
     //   3. 一致性：跨集群的时间戳一致性判断
     //   4. 过滤逻辑：DML 是否应该影响某行数据
     //
-    // 【影响的组件】（必须使用 commit_timestamp）
-    //   - QueryNode:
-    //       * DML 过滤（DELETE/UPDATE 是否应用）
-    //       * 时间旅行查询（GuaranteeTimestamp 过滤）
-    //       * 一致性快照（ServiceTimestamp 过滤）
-    //   - DataCoord:
-    //       * Segment 时间范围管理（min/max timestamp）
-    //       * Compaction 触发条件（segment 是否可 compact）
-    //       * GC 决策（segment 是否可删除）
-    //   - CDC/Replication:
-    //       * Checkpoint 计算（复制进度判断）
-    //       * 复制延迟统计（数据同步进度）
-    //   - 监控/诊断:
-    //       * Segment 时间范围展示
-    //       * 数据延迟统计
-    //       * 时序一致性检查
+    // 【影响的组件】
+    //   - QueryNode: DML 过滤、时间旅行查询、一致性快照
+    //   - DataCoord: Segment 时间范围管理、Compaction 触发、GC 决策
+    //   - CDC/Replication: Checkpoint 计算、复制进度判断
+    //   - 监控/诊断: Segment 时间范围展示、延迟统计
     //
     // 【生命周期】
-    //   1. Import 执行阶段（WaitingCommit 之前）:
-    //      - commit_timestamp = 0（未提交）
-    //      - importing = true
-    //      - 数据物理存在但逻辑上未提交，不可查询
-    //
-    //   2. Commit 提交阶段（收到 CommitImportMessage）:
-    //      - commit_timestamp = T_commit（CommitImportMessage 的广播时间戳）
-    //      - importing = false
-    //      - 数据已提交，变为可查询
-    //      - 系统使用 commit_timestamp 作为数据的逻辑时间基准
-    //
-    //   3. Compaction 标准化阶段:
-    //      - Compaction 重写每行的 row.timestamp = commit_timestamp
-    //      - 完成后清除: commit_timestamp = 0
-    //      - 物理时间与提交时间统一，回归正常 segment
+    //   1. Import 执行阶段: commit_timestamp = 0, importing = true (不可查询)
+    //   2. Commit 提交阶段: commit_timestamp = T_commit (CommitImportMessage 的广播时间戳), importing = false (可查询)
+    //   3. Compaction 标准化阶段: 重写 row.timestamp = commit_timestamp, 清除 commit_timestamp = 0
     //
     // 【重要说明】
-    //   - commit_timestamp = 0: 表示物理时间即逻辑时间（正常 segment）
-    //   - commit_timestamp != 0: 表示逻辑时间覆盖物理时间（import segment）
-    //   - 物理时间用于存储层，逻辑时间用于语义层
+    //   - commit_timestamp = 0: 物理时间即逻辑时间（正常 segment）
+    //   - commit_timestamp != 0: 逻辑时间覆盖物理时间（import segment）
     optional uint64 commit_timestamp = X;
 }
 ```
 
-**工作流程（两阶段提交）:**
-
-```
-阶段 1: Prepare（Import 执行 + WaitingCommit）
-  - Import 写入数据: row.timestamp = T_import（物理时间）
-  - 进入 WaitingCommit: segment.commit_timestamp = 0（未提交）
-  - 状态标记: segment.importing = true（不可查询）
-  → 系统行为：数据已准备好（prepared），但未提交（not committed）
-
-阶段 2: Commit（CommitImport 广播）
-  - 接收 CommitImportMessage: 广播时间戳 = T_commit
-  - 设置提交时间: segment.commit_timestamp = T_commit
-  - 状态转换: segment.importing = false（可查询）
-  - 物理时间不变: row.timestamp 仍为 T_import
-  → 系统行为：数据已提交（committed），所有时序判断使用 T_commit
-
-阶段 3: Compaction（异步标准化）
-  - 重写物理时间: row.timestamp ← segment.commit_timestamp
-  - 清除提交时间: segment.commit_timestamp = 0
-  → 系统行为：物理时间 = 提交时间，回归正常 segment
-```
-
-**示例：effective_timestamp 计算**
-
-所有组件应该使用统一的逻辑：
+所有组件使用统一的 effective timestamp 计算逻辑：
 
 ```go
-// 获取 segment 中某行数据的有效时间戳
-// 如果 segment 已提交（commit_timestamp != 0），使用提交时间
-// 否则使用物理写入时间
 func GetEffectiveTimestamp(segment *SegmentInfo, rowTimestamp uint64) uint64 {
     if segment.CommitTimestamp != 0 {
-        // Import segment 已提交：使用提交时间作为数据的逻辑存在时间
-        return segment.CommitTimestamp
+        return segment.CommitTimestamp  // Import segment: 使用逻辑提交时间
     }
-    // 正常 segment 或未提交：使用物理写入时间
-    return rowTimestamp
+    return rowTimestamp  // 正常 segment: 使用物理写入时间
 }
-
-// 应用场景示例:
-// - QueryNode: DELETE 过滤时判断 effectiveTs <= deleteTs
-//   → 使用提交时间判断 DELETE 是否应该影响 import 数据
-// - DataCoord: 判断 segment 是否超过 retention period
-//   → 使用提交时间作为 segment 的逻辑创建时间
-// - CDC: 判断数据是否已经提交并可以复制
-//   → commit_timestamp != 0 表示数据已提交
 ```
 
-### 4.3 新增 RPC 接口
+**新增 RPC 接口**
 
-#### 4.3.1 CommitImport RPC
-
-**功能：** 提交处于 WaitingCommit 状态的 import job，通过广播 CommitImportMessage 使所有集群的数据同步可查询。
-
-**接口签名：**
+*CommitImport RPC:*
 
 ```protobuf
 rpc CommitImport(CommitImportRequest) returns(common.Status) {}
@@ -577,25 +354,20 @@ message CommitImportRequest {
 }
 ```
 
-**调用约束：**
+功能：提交处于 WaitingCommit 状态的 Import Job，广播 CommitImportMessage 使所有集群数据同步可见。
+
+约束：
 - 仅在主集群调用
 - Job 必须处于 WaitingCommit 状态
-- 不自动验证从集群状态（需平台侧手动确认）
+- 不验证从集群状态（平台侧手动确认）
 - 幂等操作，可安全重试
 
-**执行流程：**
+执行流程：
 1. 验证 JobID 存在且状态为 WaitingCommit
 2. 广播 CommitImportMessage 到所有 vchannel（通过 CDC 传播）
-3. 各集群接收消息后原子地更新 segment 元数据：
-   - 设置 `segment.commit_timestamp = T_commit`
-   - 设置 `segment.importing = false`
-   - 转换状态：WaitingCommit → Completed
+3. 各集群接收消息后原子更新：设置 `segment.commit_timestamp = T_commit`，清除 `segment.importing`，转换状态 WaitingCommit → Completed
 
-#### 4.3.2 AbortImport RPC
-
-**功能：** 中止 import job，清理所有集群的导入数据和元数据。
-
-**接口签名：**
+*AbortImport RPC:*
 
 ```protobuf
 rpc AbortImport(AbortImportRequest) returns(common.Status) {}
@@ -606,27 +378,21 @@ message AbortImportRequest {
 }
 ```
 
-**调用约束：**
+功能：中止 Import Job，清理所有集群的导入数据和元数据。
+
+约束：
 - 仅在主集群调用
-- 可在任何非终止状态（Completed 和 Failed 除外）调用
-- 幂等操作，重复调用返回成功
+- 可在任何非终止状态调用（Completed 和 Failed 除外）
+- 幂等操作
 
-**执行流程：**
-1. 验证 JobID 存在且未处于终止状态
+执行流程：
+1. 验证 JobID 存在且未终止
 2. 广播 AbortImportMessage 到所有 vchannel
-3. 各集群接收消息后执行清理：
-   - 标记所有 import segment 为 Dropped
-   - 更新 Job 状态为 Failed
-   - 触发 GC 清理 binlog 和索引文件
+3. 各集群标记 Segment 为 Dropped，Job 状态转换为 Failed，触发 GC 清理
 
-**使用场景：**
-- 从集群长时间卡在某个状态，需要主动清理
-- 检测到 import 数据异常，需要回滚
-- 平台侧决策不再继续当前 import 操作
+**新增消息类型**
 
-### 4.4 新增消息类型
-
-**CommitImportMessage:**
+*CommitImportMessage:*
 
 ```protobuf
 message CommitImportMsg {
@@ -635,7 +401,9 @@ message CommitImportMsg {
 }
 ```
 
-**AbortImportMessage:**
+广播目标：Collection 的所有 vchannel，通过 CDC 链路传播至从集群。
+
+*AbortImportMessage:*
 
 ```protobuf
 message AbortImportMsg {
@@ -644,171 +412,121 @@ message AbortImportMsg {
 }
 ```
 
-### 4.5 组件改造概览
+广播目标：Collection 的所有 vchannel，通过 CDC 链路传播至从集群。
 
-| 组件 | 改造内容 | 复杂度 |
-|------|----------|--------|
-| **Meta 存储**<br>（核心改造） | • SegmentInfo proto 新增 `commit_timestamp` 字段<br>• 引入两层时间戳系统（物理 + 逻辑）<br>• UpdateSegmentVisibility 方法 | 低 |
-| **DataCoord** | • 新增 WaitingCommit 状态处理<br>• 实现 CommitImport/AbortImport RPC<br>• 自动提交逻辑（非复制集群）<br>• Commit 时设置 segment.commit_timestamp<br>• Compaction 决策使用 commit_timestamp<br>• Segment 时间范围管理使用 commit_timestamp | 中 |
-| **QueryNode** | • DML 过滤逻辑使用 effective_timestamp (commit_timestamp ?: row.timestamp)<br>• 时间旅行查询使用 effective_timestamp<br>• 一致性快照使用 effective_timestamp | 中 |
-| **ImportChecker** | • WaitingCommit 状态检查和超时处理<br>• 自动提交判断逻辑 | 低 |
-| **Compaction** | • 标准化 import segment 时间戳（重写 row.timestamp）<br>• 清除 commit_timestamp 元数据（设为 0） | 低 |
-| **CDC/Replication** | • Checkpoint 计算使用 commit_timestamp<br>• 复制进度判断使用 commit_timestamp | 低 |
-| **Monitoring** | • Segment 时间范围展示使用 commit_timestamp<br>• 延迟统计使用 commit_timestamp | 低 |
-| **Proto 定义** | • 新增消息类型<br>• 新增 RPC 定义<br>• 状态枚举扩展 | 低 |
+**基于方案的导入流程（技术视角）**
 
-**核心原则：**
-- `commit_timestamp` 是**系统级的逻辑时间戳**，不是某个组件的实现细节
-- 所有涉及"时序判断"、"因果关系"、"数据可见性"的逻辑都必须使用它
-- 物理时间戳（`row.timestamp`）仅用于存储层（binlog 读写、Compaction 重写）
+复制集群导入流程（两阶段提交）：
 
-### 4.6 向后兼容性
+1. **准备阶段（Prepare）**
+   - 平台侧在主集群调用 ImportV2 RPC
+   - DataCoord 验证请求，广播 ImportMessage 到所有 vchannel（通过 CDC 传播至从集群）
+   - 各集群 DataNode 执行 Import：从对象存储读取数据 → 写入 binlog（row.timestamp = T_import）→ 构建索引
+   - Job 状态转换：Pending → Importing → IndexBuilding → WaitingCommit
+   - WaitingCommit 状态下：segment.commit_timestamp = 0, segment.importing = true（数据不可查询）
 
-**非复制集群（无 CDC）:**
-- WaitingCommit 状态自动提交，用户无感知
-- 用户观察到的行为：IndexBuilding → Completed（与之前一致）
-- 无需修改现有 API 调用
+2. **协调阶段（Coordination）**
+   - 平台侧通过 GetImportProgress API 轮询所有集群状态
+   - 确认所有集群 Job 状态为 WaitingCommit 且 progress = 100%
+   - 若某集群长时间未达到 WaitingCommit，平台侧可选择等待或调用 AbortImport
 
-**复制集群（有 CDC）:**
-- 解除 import 阻塞限制
-- 引入新的用户操作：手动调用 CommitImport
-- 用户观察到的行为：IndexBuilding → WaitingCommit → 用户提交 → Completed
+3. **提交阶段（Commit）**
+   - 平台侧在主集群调用 CommitImport RPC
+   - DataCoord 验证 Job 状态，广播 CommitImportMessage（base.timestamp = T_commit）到所有 vchannel
+   - 各集群接收 CommitImportMessage，原子执行：
+     - 更新元数据：segment.commit_timestamp = T_commit
+     - 清除标记：segment.importing = false
+     - 状态转换：Job WaitingCommit → Completed
+   - 数据变为可查询，所有组件使用 effective_ts = commit_timestamp 进行时序判断
+
+非复制集群导入流程（自动提交）：
+
+1. 平台侧在集群调用 ImportV2 RPC
+2. Job 执行至 WaitingCommit 状态
+3. ImportChecker 检测到非复制配置，自动广播 CommitImportMessage
+4. Job 立即转换为 Completed，用户观察到平滑过渡（向后兼容）
+
+**流程图**
+
+技术视角的主从集群交互流程：
+
+```
+┌──────────────────────────────────────────────────────────────────┐
+│                         主集群 (Primary)                          │
+│                                                                    │
+│  平台侧调用: ImportV2(jobID, files, options)                      │
+│         ↓                                                          │
+│  DataCoord 验证请求，生成 JobID                                   │
+│         ↓                                                          │
+│  广播 ImportMessage(jobID, files) → 所有 vchannel                │
+│         ↓                                                          │
+│  DataNode 执行: 读取对象存储 → 写入 binlog (row.ts=T_import)     │
+│         ↓                                                          │
+│  Job 状态: Pending → Importing → IndexBuilding → WaitingCommit   │
+│         ↓                                                          │
+│  segment.importing=true, commit_timestamp=0 (数据不可见)          │
+│         ↓                                                          │
+│  [等待平台侧调用 CommitImport]                                     │
+│         ↓                                                          │
+│  平台侧调用: CommitImport(jobID)                                  │
+│         ↓                                                          │
+│  广播 CommitImportMessage(jobID, ts=T_commit) → 所有 vchannel    │
+│         ↓                                                          │
+│  原子更新: segment.commit_timestamp=T_commit, importing=false     │
+│         ↓                                                          │
+│  Job 状态: WaitingCommit → Completed                              │
+└──────────────────────────────────────────────────────────────────┘
+                           │
+                           │ CDC 链路传播
+                           ↓
+┌──────────────────────────────────────────────────────────────────┐
+│                       从集群 (Secondaries)                        │
+│                                                                    │
+│  接收 ImportMessage(jobID, files) ← CDC 链路                     │
+│         ↓                                                          │
+│  DataCoord 创建相同 JobID 的 Import Job                          │
+│         ↓                                                          │
+│  DataNode 执行: 读取对象存储 → 写入 binlog (row.ts=T_import)     │
+│         ↓                                                          │
+│  Job 状态: Pending → Importing → IndexBuilding → WaitingCommit   │
+│         ↓                                                          │
+│  segment.importing=true, commit_timestamp=0 (数据不可见)          │
+│         ↓                                                          │
+│  [等待 CommitImportMessage]                                        │
+│         ↓                                                          │
+│  接收 CommitImportMessage(jobID, ts=T_commit) ← CDC 链路         │
+│         ↓                                                          │
+│  原子更新: segment.commit_timestamp=T_commit, importing=false     │
+│         ↓                                                          │
+│  Job 状态: WaitingCommit → Completed                              │
+└──────────────────────────────────────────────────────────────────┘
+```
+
+非复制集群简化流程：
+
+```
+┌──────────────────────────────────────────────────────────────────┐
+│                      非复制集群 (Standalone)                      │
+│                                                                    │
+│  平台侧调用: ImportV2(jobID, files, options)                      │
+│         ↓                                                          │
+│  Job 状态: Pending → Importing → IndexBuilding → WaitingCommit   │
+│         ↓                                                          │
+│  ImportChecker 检测非复制配置                                     │
+│         ↓                                                          │
+│  自动广播 CommitImportMessage(jobID, ts=T_commit)                │
+│         ↓                                                          │
+│  原子更新: segment.commit_timestamp=T_commit, importing=false     │
+│         ↓                                                          │
+│  Job 状态: WaitingCommit → Completed (自动，无需平台侧干预)      │
+└──────────────────────────────────────────────────────────────────┘
+```
 
 ---
 
-## 五、API 和 Protocol Buffer 定义
+## 四、平台侧工作流
 
-### 5.1 新增 RPC 接口
-
-#### CommitImport RPC
-
-**功能:** 提交处于 WaitingCommit 状态的 import job，使数据在所有复制集群上可查询。
-
-**接口定义:**
-
-```protobuf
-service DataCoord {
-    // ... 现有方法 ...
-
-    rpc CommitImport(CommitImportRequest) returns(common.Status) {}
-    rpc AbortImport(AbortImportRequest) returns(common.Status) {}
-}
-
-message CommitImportRequest {
-    common.MsgBase base = 1;
-    string job_id = 2;  // Import job ID
-}
-
-message AbortImportRequest {
-    common.MsgBase base = 1;
-    string job_id = 2;  // Import job ID
-}
-```
-
-**调用要求:**
-
-1. 只能在主集群上调用
-2. 调用前必须确保所有集群的 job 都处于 WaitingCommit 状态
-3. 幂等操作，可以安全重试
-
-**返回值:**
-
-```json
-{
-  "error_code": "Success",
-  "reason": ""
-}
-```
-
-可能的错误:
-- `ImportJobNotExist`: Job ID 不存在
-- `InvalidState`: Job 不在 WaitingCommit 状态
-- `BroadcastFailed`: 消息广播失败（可重试）
-
-#### AbortImport RPC
-
-**功能:** 中止 import job，清理所有集群上的导入数据。
-
-**调用要求:**
-
-1. 只能在主集群上调用
-2. 可以在任何非终止状态（除 Completed 外）下调用
-3. 幂等操作，可以安全重试
-
-### 5.2 消息类型定义
-
-#### CommitImportMessage
-
-```protobuf
-message CommitImportMessageHeader {
-    int64 job_id = 1;
-}
-
-message CommitImportMsg {
-    commonpb.MsgBase base = 1;  // 包含 T_commit 时间戳
-    int64 job_id = 2;
-}
-```
-
-**广播目标:** 所有 vchannel（通过 CDC 复制到从集群）
-
-#### AbortImportMessage
-
-```protobuf
-message AbortImportMessageHeader {
-    int64 job_id = 1;
-}
-
-message AbortImportMsg {
-    commonpb.MsgBase base = 1;
-    int64 job_id = 2;
-}
-```
-
-**广播目标:** 所有 vchannel（通过 CDC 复制到从集群）
-
-### 5.3 状态枚举扩展
-
-```protobuf
-enum ImportJobStateV2 {
-    None = 0;
-    Pending = 1;
-    PreImporting = 2;
-    Importing = 3;
-    Sorting = 4;
-    IndexBuilding = 5;
-    WaitingCommit = 6;  // 新增状态
-    Completed = 7;
-    Failed = 8;
-}
-```
-
-### 5.4 GetImportProgress API 返回值
-
-**现有 API 扩展:**
-
-```json
-{
-  "status": {
-    "error_code": "Success"
-  },
-  "jobId": "123",
-  "state": "WaitingCommit",  // 新增状态
-  "progress": 100,
-  "collectionName": "my_collection",
-  "reason": "",
-  "completeTime": "",
-  "importedRows": 1000000
-}
-```
-
-**平台侧通过此 API 检查所有集群状态，确认都达到 WaitingCommit 后再调用 CommitImport。**
-
----
-
-## 六、平台侧工作流
-
-### 6.1 复制集群导入数据流程
+### 4.1 复制集群导入数据流程
 
 #### 步骤 1: 启动导入（主集群）
 
@@ -885,7 +603,7 @@ curl -X POST "http://primary:19530/v2/vectordb/jobs/import/commit" \
 }
 ```
 
-### 6.2 处理异常情况
+### 4.2 处理异常情况
 
 #### 情况 1: 某个从集群卡在 IndexBuilding
 
@@ -920,7 +638,7 @@ curl -X POST "http://primary:19530/v2/vectordb/jobs/import/commit" \
 # 再次检查所有集群状态
 ```
 
-### 6.3 非复制集群导入流程
+### 4.3 非复制集群导入流程
 
 对于没有启用 CDC 复制的集群，操作流程与之前完全一致：
 
@@ -936,7 +654,7 @@ watch -n 5 'curl "http://standalone:19530/v2/vectordb/jobs/import/get_progress?j
 # 响应: {"state": "Completed", ...}
 ```
 
-### 6.4 平台侧操作检查清单
+### 4.4 平台侧操作检查清单
 
 **导入前检查:**
 
@@ -964,9 +682,9 @@ watch -n 5 'curl "http://standalone:19530/v2/vectordb/jobs/import/get_progress?j
 
 ---
 
-## 七、测试策略
+## 五、测试策略
 
-### 7.1 功能测试
+### 5.1 功能测试
 
 #### 7.1.1 基本流程测试
 
@@ -1104,7 +822,7 @@ watch -n 5 'curl "http://standalone:19530/v2/vectordb/jobs/import/get_progress?j
   - 最终所有集群一致
 ```
 
-### 7.2 性能测试
+### 5.2 性能测试
 
 **测试用例 9: 延迟测试**
 
@@ -1155,7 +873,7 @@ watch -n 5 'curl "http://standalone:19530/v2/vectordb/jobs/import/get_progress?j
   - 数据一致性保持
 ```
 
-### 7.3 兼容性测试
+### 5.3 兼容性测试
 
 **测试用例 12: 版本升级**
 
@@ -1177,7 +895,7 @@ watch -n 5 'curl "http://standalone:19530/v2/vectordb/jobs/import/get_progress?j
 
 ---
 
-## 八、已知限制与后续优化
+## 六、已知限制与后续优化
 
 ### 8.1 当前版本的限制
 
