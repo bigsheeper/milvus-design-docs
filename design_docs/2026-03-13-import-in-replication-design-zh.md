@@ -20,17 +20,17 @@ if channelAssignment.ReplicateConfiguration != nil &&
 }
 ```
 
-这一限制严重影响了企业用户的数据迁移和导入场景，尤其是在需要持续保持主备同步的生产环境中。
+该限制严重影响企业级数据迁移和批量导入场景，尤其是在需要保持主备集群持续同步的生产环境中。
 
 ### 1.2 核心目标
 
 本设计方案旨在解除 Import 与 CDC 复制的互斥限制，在保持数据一致性的前提下，实现以下核心目标:
 
-1. **解除复制阻塞** - 允许在 CDC 复制激活状态下执行 Import 操作
-2. **强一致性保证** - 所有集群上的导入数据要么全部可见、要么全部不可见(All-or-nothing)
-3. **手动协调机制** - 操作员手动控制导入数据的可见性切换时机
-4. **CDC 兼容** - 修复按 vchannel 粒度的 TimeTick 以支持 Checkpoint 恢复
-5. **最小化复杂度** - 复用现有的 Broadcast 和 CDC 机制
+1. **解除复制阻塞** - 在 CDC 复制激活状态下允许 Import 操作执行
+2. **强一致性保证** - 跨集群导入数据可见性的原子性语义（All-or-nothing）
+3. **显式协调机制** - 通过 RPC 接口显式控制导入数据的可见性切换
+4. **CDC 兼容性** - 基于 per-vchannel TimeTick 实现精确的 Checkpoint 恢复语义
+5. **架构简洁性** - 复用现有 Broadcast 和 CDC 消息传播机制
 
 ### 1.3 非目标
 
@@ -48,11 +48,11 @@ if channelAssignment.ReplicateConfiguration != nil &&
 
 #### 难点 1: 导入时机的不确定性
 
-由于 CDC 复制存在延迟，主集群和从集群上的 Import 任务不会同时完成。如果主集群先完成导入并立即让数据可查询，而从集群还在处理中，那么：
+由于 CDC 复制链路存在固有延迟，主从集群的 Import 任务执行完成时间存在时间差。若主集群 Import 完成后立即使数据可查询，而从集群仍处于 Import 执行阶段，将导致：
 
-- **主集群**: 用户可以查询到导入的数据
-- **从集群**: 用户查询不到导入的数据（还在导入中）
-- **结果**: 主备数据不一致
+- **主集群**: 查询结果包含导入数据
+- **从集群**: 查询结果不包含导入数据（处于 Importing 状态）
+- **一致性违背**: 跨集群数据可见性不一致
 
 #### 难点 2: DML 操作与 Import 数据的时序冲突
 
@@ -164,23 +164,26 @@ Import 在复制场景下的核心难点：
 我们引入一个**手动两阶段提交协议**来解决上述问题：
 
 **阶段 1: 准备阶段（Prepare）**
-- 所有集群（主备）独立执行 Import 任务
-- Import 完成后，进入新的 **WaitingCommit** 状态
-- 在 WaitingCommit 状态下，数据已经写入存储，但标记为"不可查询"（`importing=true`）
-- 所有集群在此状态等待，直到收到提交信号
+- 各集群独立执行 Import 任务，完成数据物理写入和索引构建
+- Import 完成后，状态转换至 **WaitingCommit**
+- WaitingCommit 状态语义：数据已持久化到对象存储，但 `importing=true` 标记阻止查询可见
+- 各集群在此状态阻塞，等待外部提交信号
 
 **阶段 2: 提交阶段（Commit）**
-- 用户手动检查所有集群都达到 WaitingCommit 状态
-- 用户在主集群调用 `CommitImport` RPC
-- 主集群广播 `CommitImportMessage`（通过 CDC 复制到从集群）
-- 所有集群收到消息后，原子地将数据标记为可查询
-- 状态转换：WaitingCommit → Completed
+- 平台侧通过 GetImportProgress API 轮询，确认所有集群达到 WaitingCommit
+- 在主集群调用 `CommitImport` RPC 触发提交
+- 主集群广播 `CommitImportMessage`，通过 CDC 链路传播至从集群
+- 各集群接收消息后，执行原子状态转换：
+  - 设置 `segment.commit_timestamp` 元数据
+  - 清除 `segment.importing` 标记
+  - Job 状态转换：WaitingCommit → Completed
 
 **关键特性:**
 - **统一 JobID**: 所有集群使用相同的 JobID，确保处理的是同一个导入任务
-- **手动协调**: 用户负责确认所有集群就绪后才提交（不自动验证）
+- **手动协调**: 平台侧负责确认所有集群就绪后才提交（不自动验证）
 - **CDC 广播**: 利用现有 CDC 机制传播提交消息
 - **原子可见性**: 每个集群本地的状态转换是原子的
+- **多 VChannel 广播**: CommitImportMessage 和 AbortImportMessage 通过 collection 的所有 vchannel 广播，确保与 ImportMessage 一致的传播路径
 
 ### 3.2 方案如何解决一致性问题
 
@@ -425,7 +428,7 @@ Pending → PreImporting → Importing → Sorting → IndexBuilding → Waiting
 | **用途** | 在使导入数据可查询之前的检查点，等待提交信号 |
 | **进入条件** | IndexBuilding 成功完成（所有集群统一） |
 | **状态特征** | • Segment 已写入存储<br>• Segment 已建立索引<br>• Segment 标记 `importing=true`（不可查询）<br>• Job 元数据持久化在 etcd |
-| **退出条件** | • 收到 `CommitImportMessage` → `Completed`<br>• 收到 `AbortImportMessage` → `Failed`<br>• 超时（默认 1 小时）→ `Failed` 并自动清理 |
+| **退出条件** | • 收到 `CommitImportMessage` → `Completed`<br>• 收到 `AbortImportMessage` → `Failed` |
 | **提交触发** | • 非复制集群: 自动广播（向后兼容）<br>• 复制集群: 等待用户调用 `CommitImport` RPC |
 
 ### 4.2 Segment 元数据扩展：逻辑时间戳
@@ -557,11 +560,73 @@ func GetEffectiveTimestamp(segment *SegmentInfo, rowTimestamp uint64) uint64 {
 //   → commit_timestamp != 0 表示数据已提交
 ```
 
-### 4.3 新增消息类型
+### 4.3 新增 RPC 接口
+
+#### 4.3.1 CommitImport RPC
+
+**功能：** 提交处于 WaitingCommit 状态的 import job，通过广播 CommitImportMessage 使所有集群的数据同步可查询。
+
+**接口签名：**
+
+```protobuf
+rpc CommitImport(CommitImportRequest) returns(common.Status) {}
+
+message CommitImportRequest {
+    common.MsgBase base = 1;
+    string job_id = 2;
+}
+```
+
+**调用约束：**
+- 仅在主集群调用
+- Job 必须处于 WaitingCommit 状态
+- 不自动验证从集群状态（需平台侧手动确认）
+- 幂等操作，可安全重试
+
+**执行流程：**
+1. 验证 JobID 存在且状态为 WaitingCommit
+2. 广播 CommitImportMessage 到所有 vchannel（通过 CDC 传播）
+3. 各集群接收消息后原子地更新 segment 元数据：
+   - 设置 `segment.commit_timestamp = T_commit`
+   - 设置 `segment.importing = false`
+   - 转换状态：WaitingCommit → Completed
+
+#### 4.3.2 AbortImport RPC
+
+**功能：** 中止 import job，清理所有集群的导入数据和元数据。
+
+**接口签名：**
+
+```protobuf
+rpc AbortImport(AbortImportRequest) returns(common.Status) {}
+
+message AbortImportRequest {
+    common.MsgBase base = 1;
+    string job_id = 2;
+}
+```
+
+**调用约束：**
+- 仅在主集群调用
+- 可在任何非终止状态（Completed 和 Failed 除外）调用
+- 幂等操作，重复调用返回成功
+
+**执行流程：**
+1. 验证 JobID 存在且未处于终止状态
+2. 广播 AbortImportMessage 到所有 vchannel
+3. 各集群接收消息后执行清理：
+   - 标记所有 import segment 为 Dropped
+   - 更新 Job 状态为 Failed
+   - 触发 GC 清理 binlog 和索引文件
+
+**使用场景：**
+- 从集群长时间卡在某个状态，需要主动清理
+- 检测到 import 数据异常，需要回滚
+- 平台侧决策不再继续当前 import 操作
+
+### 4.4 新增消息类型
 
 **CommitImportMessage:**
-
-用于通知所有集群提交 import job，使数据可查询。
 
 ```protobuf
 message CommitImportMsg {
@@ -572,8 +637,6 @@ message CommitImportMsg {
 
 **AbortImportMessage:**
 
-用于中止 import job，清理数据。
-
 ```protobuf
 message AbortImportMsg {
     commonpb.MsgBase base = 1;
@@ -581,7 +644,7 @@ message AbortImportMsg {
 }
 ```
 
-### 4.4 组件改造概览
+### 4.5 组件改造概览
 
 | 组件 | 改造内容 | 复杂度 |
 |------|----------|--------|
@@ -599,7 +662,7 @@ message AbortImportMsg {
 - 所有涉及"时序判断"、"因果关系"、"数据可见性"的逻辑都必须使用它
 - 物理时间戳（`row.timestamp`）仅用于存储层（binlog 读写、Compaction 重写）
 
-### 4.5 向后兼容性
+### 4.6 向后兼容性
 
 **非复制集群（无 CDC）:**
 - WaitingCommit 状态自动提交，用户无感知
@@ -739,13 +802,13 @@ enum ImportJobStateV2 {
 }
 ```
 
-**用户通过此 API 检查所有集群状态，确认都达到 WaitingCommit 后再调用 CommitImport。**
+**平台侧通过此 API 检查所有集群状态，确认都达到 WaitingCommit 后再调用 CommitImport。**
 
 ---
 
-## 六、用户操作指南
+## 六、平台侧工作流
 
-### 6.1 在复制集群上导入数据
+### 6.1 复制集群导入数据流程
 
 #### 步骤 1: 启动导入（主集群）
 
@@ -857,24 +920,7 @@ curl -X POST "http://primary:19530/v2/vectordb/jobs/import/commit" \
 # 再次检查所有集群状态
 ```
 
-#### 情况 3: 超时自动中止
-
-如果 job 在 WaitingCommit 状态超过 1 小时（默认配置），系统会自动中止：
-
-```bash
-# 所有集群会自动转换为 Failed
-# 检查失败原因
-curl "http://primary:19530/v2/vectordb/jobs/import/get_progress?jobId=job-123456"
-
-# 响应:
-{
-  "jobId": "job-123456",
-  "state": "Failed",
-  "reason": "Timeout in WaitingCommit state after 1 hour"
-}
-```
-
-### 6.3 在非复制集群上导入数据（无变化）
+### 6.3 非复制集群导入流程
 
 对于没有启用 CDC 复制的集群，操作流程与之前完全一致：
 
@@ -890,7 +936,7 @@ watch -n 5 'curl "http://standalone:19530/v2/vectordb/jobs/import/get_progress?j
 # 响应: {"state": "Completed", ...}
 ```
 
-### 6.4 操作清单
+### 6.4 平台侧操作检查清单
 
 **导入前检查:**
 
@@ -1022,21 +1068,7 @@ watch -n 5 'curl "http://standalone:19530/v2/vectordb/jobs/import/get_progress?j
   - etcd 元数据清理
 ```
 
-**测试用例 7: WaitingCommit 超时**
-
-```
-目标: 验证超时自动中止机制
-步骤:
-  1. Import 到 WaitingCommit
-  2. 等待超过 1 小时（或调整配置为更短时间）
-  3. 验证自动转换为 Failed
-验收:
-  - 系统自动广播 AbortImportMessage
-  - 所有集群清理数据
-  - 日志记录超时原因
-```
-
-**测试用例 8: 从集群未就绪时提交（用户错误）**
+**测试用例 7: 从集群未就绪时提交（平台操作错误）**
 
 ```
 目标: 验证过早提交的行为
@@ -1054,7 +1086,7 @@ watch -n 5 'curl "http://standalone:19530/v2/vectordb/jobs/import/get_progress?j
   - 出现主备不一致（符合预期 - 用户错误）
 ```
 
-**测试用例 9: 网络分区和消息重传**
+**测试用例 8: 网络分区和消息重传**
 
 ```
 目标: 验证消息丢失和重试机制
@@ -1074,7 +1106,7 @@ watch -n 5 'curl "http://standalone:19530/v2/vectordb/jobs/import/get_progress?j
 
 ### 7.2 性能测试
 
-**测试用例 10: 延迟测试**
+**测试用例 9: 延迟测试**
 
 ```
 目标: 验证 CommitImport 的延迟
@@ -1089,7 +1121,7 @@ watch -n 5 'curl "http://standalone:19530/v2/vectordb/jobs/import/get_progress?j
   - 状态转换 < 5s
 ```
 
-**测试用例 11: 大规模并发导入**
+**测试用例 10: 大规模并发导入**
 
 ```
 目标: 验证多个 import job 并发
@@ -1105,7 +1137,7 @@ watch -n 5 'curl "http://standalone:19530/v2/vectordb/jobs/import/get_progress?j
   - 所有 job 最终一致
 ```
 
-**测试用例 12: 长时间压力测试**
+**测试用例 11: 长时间压力测试**
 
 ```
 目标: 验证稳定性
@@ -1125,7 +1157,7 @@ watch -n 5 'curl "http://standalone:19530/v2/vectordb/jobs/import/get_progress?j
 
 ### 7.3 兼容性测试
 
-**测试用例 13: 版本升级**
+**测试用例 12: 版本升级**
 
 ```
 目标: 验证从旧版本升级
@@ -1143,16 +1175,6 @@ watch -n 5 'curl "http://standalone:19530/v2/vectordb/jobs/import/get_progress?j
   - 非复制模式仍正常（向后兼容）
 ```
 
-### 7.4 测试覆盖率目标
-
-| 模块 | 目标覆盖率 |
-|------|----------|
-| DataCoord Import 逻辑 | > 90% |
-| QueryNode 过滤逻辑 | > 95% |
-| ImportChecker 状态机 | 100% |
-| RPC 处理 | > 90% |
-| 消息广播 | > 85% |
-
 ---
 
 ## 八、已知限制与后续优化
@@ -1162,96 +1184,56 @@ watch -n 5 'curl "http://standalone:19530/v2/vectordb/jobs/import/get_progress?j
 #### 限制 1: 无自动一致性验证
 
 **问题描述:**
-主集群在调用 CommitImport 时，不会自动检查所有从集群是否都处于 WaitingCommit 状态。如果用户过早提交，可能导致主备不一致。
+CommitImport RPC 执行时不会跨集群验证所有从集群的 Job 状态。若在从集群未达到 WaitingCommit 状态时调用该 RPC，将导致跨集群数据可见性不一致。
 
-**用户影响:**
-- 需要用户手动检查所有集群状态
-- 容易人为出错
+**系统行为:**
+- 主集群执行提交，从集群接收到 CommitImportMessage 时仍处于 Importing/IndexBuilding 状态
+- 从集群丢弃该消息（状态不匹配），继续执行 Import
+- 最终主集群数据可见，从集群 Job 因超时或其他原因失败
 
 **缓解措施:**
-- 提供详细的操作文档和检查清单
-- 在监控系统中添加跨集群状态检查仪表板
-- 考虑提供自动化脚本辅助检查
+- 提供标准化的操作流程文档和状态检查脚本
+- 在可观测性系统中实现跨集群状态聚合视图
+- 通过 API 网关层实现集群状态预检查逻辑
 
-**后续优化:**
-Phase 2 可以实现主集群自动查询从集群状态，在都就绪之前拒绝提交。
-
-#### 限制 2: WaitingCommit 期间的 DML 语义歧义
+#### 限制 2: WaitingCommit 期间的 DML 交互语义
 
 **问题描述:**
-如果在 WaitingCommit 期间执行 DML 操作（特别是 DELETE），可能出现"已删除的行重新出现"的现象。
+WaitingCommit 状态下的 Segment 不参与查询，但与后续 DML 操作存在主键冲突风险。当 Commit 后 Segment 可见时，可能违背 DML 操作的语义预期。
 
-**示例:**
+**场景示例:**
 
 ```
-T=1000: Import 数据 pk=2（隐藏）
-T=2000: INSERT pk=2（用户操作）
-T=2500: DELETE pk=2（用户认为已删除）
-T=3000: CommitImport → import 的 pk=2 出现
-→ 结果: pk=2 "复活"，违反用户预期
+T=1000: Import segment 包含 pk=2，状态=WaitingCommit（查询不可见）
+T=2000: INSERT pk=2（写入成功，因 Import segment 查询不可见）
+T=2500: DELETE pk=2（删除 T=2000 的 INSERT）
+T=3000: CommitImport → Import segment 的 pk=2 变为可见
+→ 结果: pk=2 存在（Import 数据），违背 T=2500 DELETE 的预期
 ```
 
-**当前方案:**
-暂不处理此问题，但会在文档中明确说明。
+**当前策略:**
+该语义问题在文档中明确声明，但系统不做运行时阻止。
 
 **推荐实践:**
-- 建议用户在所有 import job 完成后再执行 DML 操作
-- 或者对不同的数据集使用不同的 partition，避免冲突
-
-**后续优化:**
-考虑两种方案：
-1. **阻止 DML**: WaitingCommit 期间禁止 DML 操作（简单但用户体验差）
-2. **DML 重放**: 记录 WaitingCommit 期间的 DML，commit 后重放（复杂）
+- Import 与 DML 操作时间隔离：Import 完成后再执行 DML
+- 数据空间隔离：使用不同 Partition 避免主键冲突域重叠
 
 ### 8.2 性能限制
 
-#### 限制 3: Segment 可见性更新需要 etcd 写入
+#### 限制 3: Segment 元数据更新的 etcd 写入开销
 
 **问题描述:**
-CommitImport 需要更新所有 import segment 的元数据（commit_timestamp），这会产生多次 etcd 写入。
+CommitImport 需要对所有 Import Segment 的 SegmentInfo 执行 etcd 写操作，设置 `commit_timestamp` 字段并清除 `importing` 标记。当单个 Job 产生大量 Segment 时（如数百个），该操作的延迟随 Segment 数量线性增长。
 
-**影响范围:**
-- 如果单个 import job 创建了数百个 segment，提交延迟会增加
-- 大规模 import 场景下可能成为瓶颈
+**性能影响:**
+- 单 Job 产生 100+ Segment 时，Commit 操作延迟可能达到秒级
+- etcd 集群的写入 QPS 上限成为系统吞吐瓶颈
+- 大规模并发 Import 场景下，Commit 操作可能相互阻塞
 
 **缓解措施:**
-- Batch 更新 segment 元数据（一次 etcd 事务更新多个 segment）
-- 合理控制单个 import job 的 segment 数量
-
-**后续优化:**
-考虑使用更轻量的元数据存储方式。
-
-### 8.3 未来工作
-
-#### Phase 2: 自动协调
-
-1. **主集群自动验证从集群状态**
-   - CommitImport RPC 先查询所有从集群状态
-   - 如果有从集群未就绪，返回错误并等待
-
-2. **状态同步仪表板**
-   - 可视化展示所有集群的 import job 状态
-   - 自动检测和告警主备不一致
-
-#### Phase 3: 高级 DML 处理
-
-1. **DML 重放机制**
-   - 记录 WaitingCommit 期间的 DML 操作
-   - Commit 后自动重放，解决"行重新出现"问题
-
-2. **临时集合方法**
-   - Import 到临时集合，commit 时原子 swap
-   - 完全避免 DML 交互问题
-
-#### Phase 4: 性能优化
-
-1. **Compaction 异步标准化**
-   - 后台自动 compaction 清理 commit_timestamp
-   - 减少元数据开销
-
-2. **分层对象存储**
-   - 跨区域复制使用本地缓存
-   - 减少跨区域网络延迟
+- 实现 Segment 元数据批量更新事务（单次 etcd txn 更新多个 SegmentInfo）
+- 通过调整 Import 参数控制单 Job 的 Segment 数量（如 `segment_max_size`）
+- 考虑采用分层元数据架构，减少 etcd 写入压力
 
 ---
 
