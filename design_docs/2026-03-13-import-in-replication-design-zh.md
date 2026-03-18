@@ -159,113 +159,206 @@ Import 在复制场景下的核心难点：
 
 ## 三、解决方案
 
-本方案通过引入两阶段提交协议（Two-Phase Commit Protocol）解决 Import 在复制场景下的数据一致性问题。核心机制包括新增 WaitingCommit 中间状态、commit_timestamp 逻辑时间戳元数据、以及 CommitImport/AbortImport RPC 接口，实现跨集群数据可见性的原子化控制。
+### 3.1 核心思路
 
-**核心设计思想：**
+**问题本质**：跨集群物理执行顺序不可控（CDC 延迟、Compaction 触发时机差异）导致数据可见性不一致。
 
-Import 操作分解为 Prepare 和 Commit 两个阶段，在 Prepare 阶段各集群独立执行数据写入和索引构建，完成后进入 WaitingCommit 状态等待提交信号；在 Commit 阶段由平台侧显式调用 CommitImport RPC，通过 CDC 链路广播提交消息，各集群接收后原子地切换数据可见性。
+**解决思路**：引入事务时间基准，解耦物理执行与数据可见性。
 
-**架构特性：**
-- **状态解耦**：物理数据准备（Prepare）与逻辑数据可见（Commit）分离
-- **统一协调**：所有集群基于相同 JobID 和 commit_timestamp 实现跨集群一致性
-- **显式控制**：平台侧显式触发提交，无自动提交逻辑（复制场景下）
-- **CDC 传播**：复用现有 CDC 消息广播机制，CommitImportMessage 通过所有 vchannel 传播
-- **原子转换**：各集群本地状态转换为原子操作，无中间状态
+**核心机制**：两阶段提交协议（Two-Phase Commit Protocol）
+- **Prepare 阶段**：各集群独立执行物理数据准备（写入、索引构建）
+- **Commit 阶段**：统一逻辑可见时间，所有集群原子地切换数据可见性
 
-**方案如何解决一致性问题**
+### 3.2 三个关键设计
 
-**(1) 时机同步问题的解决**
+#### 3.2.1 WaitingCommit 状态
 
-WaitingCommit 状态将数据物理准备完成与逻辑可见性解耦，消除了 CDC 延迟导致的主从集群 Import 完成时间差异：
+**作用**：将"物理准备完成"与"数据可见"解耦。
 
+**特征**：
+- Segment 已写入对象存储并完成索引构建
+- 标记 `importing=true`，查询不可见
+- Job 元数据持久化在 etcd
+
+**状态转换**：
 ```
-主集群:
-T=1000: Import 完成 → WaitingCommit（数据隐藏）
-T=2000: 等待从集群...
-T=3000: 收到 CommitImportMessage → Completed（数据可见）
-
-从集群:
-T=1200: Import 完成 → WaitingCommit（数据隐藏）
-T=3000: 收到 CommitImportMessage → Completed（数据可见）
-
-结果: 两个集群同时在 T=3000 让数据可查询
+IndexBuilding → WaitingCommit
+                ↓
+    收到 CommitImportMessage → Completed
+    收到 AbortImportMessage  → Failed
 ```
 
-**(2) 时间戳语义问题的解决**
+**触发机制**：
+- **复制集群**：等待平台侧调用 CommitImport RPC
+- **非复制集群**：自动广播 CommitImportMessage（向后兼容）
 
-引入 segment 级的 `commit_timestamp` 元数据字段，作为系统级逻辑时间戳，与物理写入时间 `row.timestamp` 解耦。时间戳语义修正机制如下：
+#### 3.2.2 commit_timestamp（Commit Time）
 
-```
-T=1000: Import 开始，行写入 binlog，row.timestamp = 1000（物理时间）
-        → Segment 处于 WaitingCommit，importing=true
-        → segment.commit_timestamp = 0（逻辑时间未设置）
+**问题**：`row.timestamp` 是 Write Time（数据写入存储的时间），各集群不同。
 
-T=2000: DELETE pk=2, delete.timestamp = 2000
-        → QueryNode 看不到隐藏的 segment，DELETE 不应用
+**方案**：`segment.commit_timestamp` 是 Commit Time（数据事务提交的时间），所有集群相同。
 
-T=3000: CommitImport 广播，广播时间戳 T_commit = 3000
-        → DataCoord 设置: segment.commit_timestamp = 3000（逻辑时间）
-        → Segment 变为可查询: importing=false
+**时间戳系统**：
 
-T=4000: 用户查询 pk=2
-        → 系统统一使用逻辑时间:
-            effective_ts = segment.commit_timestamp ?: row.timestamp
-            effective_ts = 3000（使用逻辑时间）
+| 时间戳类型 | 存储位置 | 语义 | 使用场景 |
+|-----------|---------|------|----------|
+| **Write Time**<br>`row.timestamp` | Binlog 行数据 | 数据写入对象存储的时间 | 存储层操作、Compaction 重写 |
+| **Commit Time**<br>`commit_timestamp` | SegmentInfo 元数据 | 数据事务提交的时间 | 时序判断、DML 过滤、CDC、GC |
 
-        → DELETE 检查: effective_ts (3000) > delete.ts (2000)
-        → 结论: DELETE 不生效，pk=2 可见
-```
+**使用规则**：所有涉及时序判断的逻辑使用 effective timestamp：
 
-- Import 数据的物理写入时间（`row.timestamp` = T_import）存储在 binlog，记录数据写入对象存储的时间点
-- Import 数据的逻辑存在时间（`segment.commit_timestamp` = T_commit）存储在元数据，记录数据提交可见的时间点
-- 系统所有时序判断、DML 过滤、因果关系分析统一使用逻辑时间，确保跨集群一致性
-- T_commit 之前的 DML 操作不影响 Import 数据（因逻辑上数据尚未存在）
-- T_commit 之后的 DML 操作按照正常时序规则应用
-
-**(3) 跨集群一致性保证**
-
-通过统一的逻辑时间基准消除物理执行顺序差异。所有集群从同一 CommitImportMessage 广播获取相同的 commit_timestamp，确保跨集群时序判断结果一致：
-
-```
-主集群:
-T=1000: Import, row.ts = 1000（物理时间）
-T=2000: DELETE pk=2, delete.ts = 2000
-T=3000: CommitImport, segment.commit_timestamp = 3000（逻辑时间）
-→ 系统时序判断: effective_ts (3000) > delete.ts (2000) → pk=2 可见
-
-从集群:
-T=1200: Import, row.ts = 1000（物理时间）
-T=3000: CommitImport, segment.commit_timestamp = 3000（逻辑时间，与主集群相同）
-T=3100: CDC 收到 DELETE, delete.ts = 2000
-→ 系统时序判断: effective_ts (3000) > delete.ts (2000) → pk=2 可见
-
-结果: 主备行为一致！✓
+```go
+func GetEffectiveTimestamp(segment *SegmentInfo, rowTimestamp uint64) uint64 {
+    if segment.CommitTimestamp != 0 {
+        return segment.CommitTimestamp  // Import segment: 使用 Commit Time
+    }
+    return rowTimestamp  // 正常 segment: 使用 Write Time
+}
 ```
 
-一致性保证的本质：所有集群使用相同的 commit_timestamp 作为逻辑时间基准，无论各集群的物理执行顺序（如 Compaction 触发时机）如何差异，基于逻辑时间的时序判断结果始终一致。对比方案（无 commit_timestamp）：
+**生命周期**：
+1. **Import 阶段**：`commit_timestamp = 0`, `importing = true`（数据不可见）
+2. **Commit 阶段**：`commit_timestamp = T_commit`, `importing = false`（数据可见）
+3. **Compaction 后**：`commit_timestamp = 0`（row.timestamp 已标准化）
+
+#### 3.2.3 显式 Commit 控制
+
+**CommitImport RPC**：平台侧确认所有集群就绪后显式触发提交。
+
+**广播机制**：CommitImportMessage 通过 Collection 的所有 vchannel 传播，CDC 链路复制到从集群。
+
+**原子转换**：各集群接收消息后本地原子执行：
+- 更新元数据：`segment.commit_timestamp = T_commit`
+- 清除标记：`segment.importing = false`
+- 状态转换：`Job WaitingCommit → Completed`
+
+### 3.3 方案如何解决一致性问题
+
+**问题场景（无 commit_timestamp）：**
 
 ```
-主集群:
-T=50000: Import 完成，row.ts = 1000
-T=51000: Compaction 触发
-         → DELETE (ts=2000) vs row (ts=1000)
-         → 1000 < 2000 → DELETE 应用 → pk=2 被删除 ✓
+主集群：
+T=1000: 主集群执行 Import
+        → ImportMessage 广播，开始导入数据
+        → 导入数据: (pk=1,2,3,......)
+        → 导入数据的 row.timestamp=T1000
 
-从集群:
-T=60000: Compaction 触发（Import 还未完成）
-         → Import segment 不参与 compaction
-T=61000: Import 完成，row.ts = 1000
-         → DELETE (ts=2000) 已经应用过
-         → 但 Import segment 不受影响 → pk=2 存在 ✗
+T=2000: 主集群执行 DELETE pk=2
+        → DELETE 消息写入 WAL，时间戳 ts=2000
+......
 
-结果: 主备不一致！
+T=50000: 主集群 Import 完成
+        → 导入数据可见，可见时间=50000
+
+T=51000: 主集群触发 L0Compaction
+        → pk=2 Deleted!
+
+备集群：
+T=1000: 备集群通过 CDC 接收到 ImportMessage
+        → ImportMessage 广播，开始导入数据
+        → 导入数据: (pk=1,2,3,......)
+        → 导入数据的 row.timestamp=T1000
+
+T=2000: 备集群通过 CDC 收到 DELETE 消息 (ts=2000)
+        → DELETE 消息写入 WAL，时间戳 ts=2000
+......
+
+T=60000: 备集群触发 L0Compaction
+        → Import 还未完成
+        → pk=2 NOT Deleted!
+
+T=61000: 备集群 Import 完成
+        → 导入数据可见，可见时间=61000
+        → pk=2 Imported!
+
+结果:
+主备数据不一致!
 ```
 
-commit_timestamp 解决的本质：通过逻辑时间与物理时间的解耦，使系统时序判断独立于不可控的物理执行顺序，建立跨集群一致性基准。
+**方案解决（引入 commit_timestamp）：**
 
-**状态机扩展**
+```
+主集群：
+T=1000: Import 执行，row.timestamp=1000（Write Time）
+        → WaitingCommit, segment.commit_timestamp=0
+T=2000: DELETE pk=2, delete.ts=2000
+T=3000: CommitImport 广播，segment.commit_timestamp=3000（Commit Time）
+        → 系统时序判断: effective_ts (3000) > delete.ts (2000)
+        → pk=2 可见 ✓
 
-ImportJob 状态机新增 WaitingCommit 中间状态，位于 IndexBuilding 和 Completed 之间：
+备集群：
+T=1000: Import 执行，row.timestamp=1000（Write Time）
+        → WaitingCommit, segment.commit_timestamp=0
+T=2000: DELETE pk=2, delete.ts=2000
+T=3000: CommitImport 广播，segment.commit_timestamp=3000（Commit Time，与主集群相同）
+        → 系统时序判断: effective_ts (3000) > delete.ts (2000)
+        → pk=2 可见 ✓
+
+结果:
+主备数据一致！
+```
+
+**解决本质**：引入 `commit_timestamp` 作为系统级 Commit Time，所有集群使用统一的 commit_timestamp 进行时序判断，消除物理执行顺序（如 Compaction 触发时机）差异导致的不一致。
+
+### 3.4 多 vchannel 一致性处理
+
+**问题**：Import job 跨多个 vchannel 时，如何协调 CommitImportMessage 的处理？
+
+**核心挑战**：
+1. **原子性问题**：v1 处理完就标记 job=Completed，v2/v3 还在处理 → job 状态不一致
+2. **DML 消费问题**：commit 期间是否阻塞 DML？阻塞影响吞吐，不阻塞如何保证写一致性？
+3. **写一致性问题**：v1 已设置 commit_timestamp，v2 还没设置，DELETE 操作在两个 vchannel 上行为是否一致？
+
+**方案：异步等待 + 不阻塞 DML**
+
+**三个关键机制**：
+1. **新增 Committing 状态**：表示"已发起 commit，等待所有 vchannel 确认"
+2. **CommitImport RPC 立即返回**：不等待所有 vchannel，直接返回成功
+3. **Background checker 异步监控**：定期检查所有 vchannel 是否确认完成，全部完成后转到 Completed
+
+**完整流程**：
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│ T1: 平台侧调用 CommitImport RPC                             │
+│     DataCoord 处理：                                        │
+│     ├─ 初始化跟踪：{v1: false, v2: false, v3: false}       │
+│     ├─ 状态转换：WaitingCommit → Committing               │
+│     ├─ 广播 CommitImportMessage 到所有 vchannel           │
+│     └─ 立即返回 success ✅ (< 100ms)                       │
+└─────────────────────────────────────────────────────────────┘
+                              │
+          ┌───────────────────┼───────────────────┐
+          ↓                   ↓                   ↓
+  ┌─────────────┐     ┌─────────────┐     ┌─────────────┐
+  │ vchannel v1 │     │ vchannel v2 │     │ vchannel v3 │
+  │             │     │             │     │             │
+  │ T2: 收到消息│     │ T3: 收到消息│     │ T4: 收到消息│
+  │ 设置 commit │     │ (延迟)      │     │ (延迟)      │
+  │ _timestamp  │     │ 设置 commit │     │ 设置 commit │
+  │ 标记确认 ✅ │     │ _timestamp  │     │ _timestamp  │
+  │             │     │ 标记确认 ✅ │     │ 标记确认 ✅ │
+  │ 继续消费DML │     │ 继续消费DML │     │ 继续消费DML │
+  └─────────────┘     └─────────────┘     └─────────────┘
+          │                   │                   │
+          └───────────────────┼───────────────────┘
+                              ↓
+          ┌───────────────────────────────────────┐
+          │ T5: Background Checker 检测           │
+          │     AllVChannelsCommitted? → true     │
+          │     状态转换：Committing → Completed  │
+          └───────────────────────────────────────┘
+```
+
+**关键点**：
+- **DML 不阻塞**：各 vchannel 独立处理 CommitImportMessage，不阻塞后续 DML 消费
+- **写一致性保证**：
+  - 已设置 commit_timestamp 的 vchannel：DELETE 判断使用 Commit Time
+  - 未设置的 vchannel：Segment 仍标记 importing=true，DELETE 不可见该数据
+  - 最终所有 vchannel 设置完成后，行为一致
+- **Job 状态一致性**：通过 Committing 中间状态避免过早标记 Completed
+
+**状态机扩展**：
 
 ```
 原状态机 (8 状态):
@@ -273,182 +366,27 @@ Pending → PreImporting → Importing → Sorting → IndexBuilding → Complet
            ↓              ↓           ↓            ↓              ↓
                             Failed (任意阶段)
 
-新状态机 (9 状态):
-Pending → PreImporting → Importing → Sorting → IndexBuilding → WaitingCommit → Completed
-           ↓              ↓           ↓            ↓               ↓              ↓
+新状态机 (10 状态):
+Pending → PreImporting → Importing → Sorting → IndexBuilding → WaitingCommit → Committing → Completed
+           ↓              ↓           ↓            ↓               ↓              ↓            ↓
                             Failed (任意阶段，或显式 AbortImport)
 ```
 
-**WaitingCommit 状态语义：**
-- **进入条件**：IndexBuilding 完成，所有 Segment 已写入对象存储并完成索引构建
-- **状态特征**：Segment 标记 `importing=true`，查询不可见；Job 元数据持久化在 etcd
-- **退出条件**：接收 CommitImportMessage → Completed，或接收 AbortImportMessage → Failed
-- **触发机制**：复制集群等待平台侧调用 CommitImport RPC；非复制集群自动广播 CommitImportMessage
+**状态语义**：
+- **WaitingCommit**：等待平台侧调用 CommitImport RPC（复制集群）或自动提交（非复制集群）
+- **Committing**：CommitImportMessage 已广播，等待所有 vchannel 确认完成
+- **Completed**：所有 vchannel 已完成 commit，数据全局可见
 
-**commit_timestamp 元数据字段**
+### 3.5 完整流程
 
-SegmentInfo proto 新增 `commit_timestamp` 字段，实现两层时间戳系统：
+#### 3.5.1 复制集群导入流程
 
-| 时间戳类型 | 存储位置 | 语义 | 使用场景 |
-|-----------|---------|------|----------|
-| `row.timestamp` | Binlog 行数据 | 数据写入对象存储的物理时间 | 物理存储、Compaction 重写 |
-| `segment.commit_timestamp` | SegmentInfo 元数据 | 数据逻辑可见的提交时间 | 时序判断、DML 过滤、CDC checkpoint |
+**关键步骤**：
+1. **Prepare**：各集群执行 Import → WaitingCommit
+2. **Coordination**：平台侧轮询确认所有集群状态
+3. **Commit**：广播 CommitImportMessage → 统一可见
 
-```protobuf
-message SegmentInfo {
-    // ... 现有字段 ...
-
-    // commit_timestamp: Segment 的提交时间戳（系统级时序语义）
-    //
-    // 【核心概念】
-    // 两层时间戳系统：
-    //   - row.timestamp      = 物理写入时间（Import 执行时写入 binlog）
-    //   - commit_timestamp  = 提交时间（CommitImport 时设置，表示数据的逻辑存在时间）
-    //
-    // 【使用规则】
-    // 系统中任何涉及以下判断的逻辑，都必须使用 commit_timestamp（如果非零）：
-    //   1. 时序比较：数据是否在某个时间点"存在"
-    //   2. 因果关系：操作 A 是否发生在操作 B 之前/之后
-    //   3. 一致性：跨集群的时间戳一致性判断
-    //   4. 过滤逻辑：DML 是否应该影响某行数据
-    //
-    // 【影响的组件】
-    //   - QueryNode: DML 过滤、时间旅行查询、一致性快照
-    //   - DataCoord: Segment 时间范围管理、Compaction 触发、GC 决策
-    //   - CDC/Replication: Checkpoint 计算、复制进度判断
-    //   - 监控/诊断: Segment 时间范围展示、延迟统计
-    //
-    // 【生命周期】
-    //   1. Import 执行阶段: commit_timestamp = 0, importing = true (不可查询)
-    //   2. Commit 提交阶段: commit_timestamp = T_commit (CommitImportMessage 的广播时间戳), importing = false (可查询)
-    //   3. Compaction 标准化阶段: 重写 row.timestamp = commit_timestamp, 清除 commit_timestamp = 0
-    //
-    // 【重要说明】
-    //   - commit_timestamp = 0: 物理时间即逻辑时间（正常 segment）
-    //   - commit_timestamp != 0: 逻辑时间覆盖物理时间（import segment）
-    optional uint64 commit_timestamp = X;
-}
-```
-
-所有组件使用统一的 effective timestamp 计算逻辑：
-
-```go
-func GetEffectiveTimestamp(segment *SegmentInfo, rowTimestamp uint64) uint64 {
-    if segment.CommitTimestamp != 0 {
-        return segment.CommitTimestamp  // Import segment: 使用逻辑提交时间
-    }
-    return rowTimestamp  // 正常 segment: 使用物理写入时间
-}
-```
-
-**新增 RPC 接口**
-
-*CommitImport RPC:*
-
-```protobuf
-rpc CommitImport(CommitImportRequest) returns(common.Status) {}
-
-message CommitImportRequest {
-    common.MsgBase base = 1;
-    string job_id = 2;
-}
-```
-
-功能：提交处于 WaitingCommit 状态的 Import Job，广播 CommitImportMessage 使所有集群数据同步可见。
-
-约束：
-- 仅在主集群调用
-- Job 必须处于 WaitingCommit 状态
-- 不验证从集群状态（平台侧手动确认）
-- 幂等操作，可安全重试
-
-执行流程：
-1. 验证 JobID 存在且状态为 WaitingCommit
-2. 广播 CommitImportMessage 到所有 vchannel（通过 CDC 传播）
-3. 各集群接收消息后原子更新：设置 `segment.commit_timestamp = T_commit`，清除 `segment.importing`，转换状态 WaitingCommit → Completed
-
-*AbortImport RPC:*
-
-```protobuf
-rpc AbortImport(AbortImportRequest) returns(common.Status) {}
-
-message AbortImportRequest {
-    common.MsgBase base = 1;
-    string job_id = 2;
-}
-```
-
-功能：中止 Import Job，清理所有集群的导入数据和元数据。
-
-约束：
-- 仅在主集群调用
-- 可在任何非终止状态调用（Completed 和 Failed 除外）
-- 幂等操作
-
-执行流程：
-1. 验证 JobID 存在且未终止
-2. 广播 AbortImportMessage 到所有 vchannel
-3. 各集群标记 Segment 为 Dropped，Job 状态转换为 Failed，触发 GC 清理
-
-**新增消息类型**
-
-*CommitImportMessage:*
-
-```protobuf
-message CommitImportMsg {
-    commonpb.MsgBase base = 1;  // 包含时间戳 T_commit
-    int64 job_id = 2;
-}
-```
-
-广播目标：Collection 的所有 vchannel，通过 CDC 链路传播至从集群。
-
-*AbortImportMessage:*
-
-```protobuf
-message AbortImportMsg {
-    commonpb.MsgBase base = 1;
-    int64 job_id = 2;
-}
-```
-
-广播目标：Collection 的所有 vchannel，通过 CDC 链路传播至从集群。
-
-**基于方案的导入流程（技术视角）**
-
-复制集群导入流程（两阶段提交）：
-
-1. **准备阶段（Prepare）**
-   - 平台侧在主集群调用 ImportV2 RPC
-   - DataCoord 验证请求，广播 ImportMessage 到所有 vchannel（通过 CDC 传播至从集群）
-   - 各集群 DataNode 执行 Import：从对象存储读取数据 → 写入 binlog（row.timestamp = T_import）→ 构建索引
-   - Job 状态转换：Pending → Importing → IndexBuilding → WaitingCommit
-   - WaitingCommit 状态下：segment.commit_timestamp = 0, segment.importing = true（数据不可查询）
-
-2. **协调阶段（Coordination）**
-   - 平台侧通过 GetImportProgress API 轮询所有集群状态
-   - 确认所有集群 Job 状态为 WaitingCommit 且 progress = 100%
-   - 若某集群长时间未达到 WaitingCommit，平台侧可选择等待或调用 AbortImport
-
-3. **提交阶段（Commit）**
-   - 平台侧在主集群调用 CommitImport RPC
-   - DataCoord 验证 Job 状态，广播 CommitImportMessage（base.timestamp = T_commit）到所有 vchannel
-   - 各集群接收 CommitImportMessage，原子执行：
-     - 更新元数据：segment.commit_timestamp = T_commit
-     - 清除标记：segment.importing = false
-     - 状态转换：Job WaitingCommit → Completed
-   - 数据变为可查询，所有组件使用 effective_ts = commit_timestamp 进行时序判断
-
-非复制集群导入流程（自动提交）：
-
-1. 平台侧在集群调用 ImportV2 RPC
-2. Job 执行至 WaitingCommit 状态
-3. ImportChecker 检测到非复制配置，自动广播 CommitImportMessage
-4. Job 立即转换为 Completed，用户观察到平滑过渡（向后兼容）
-
-**流程图**
-
-技术视角的主从集群交互流程：
+**复制集群导入流程图**：
 
 ```
 ┌──────────────────────────────────────────────────────────────────┐
@@ -502,7 +440,11 @@ message AbortImportMsg {
 └──────────────────────────────────────────────────────────────────┘
 ```
 
-非复制集群简化流程：
+#### 3.5.2 非复制集群导入流程（向后兼容）
+
+**自动提交机制**：ImportChecker 检测到非复制配置，自动广播 CommitImportMessage。
+
+**流程图**：
 
 ```
 ┌──────────────────────────────────────────────────────────────────┐
@@ -521,6 +463,127 @@ message AbortImportMsg {
 │  Job 状态: WaitingCommit → Completed (自动，无需平台侧干预)      │
 └──────────────────────────────────────────────────────────────────┘
 ```
+
+用户观察到的行为：IndexBuilding → Completed（平滑过渡，无感知）
+
+### 3.6 技术实现细节
+
+#### 3.6.1 commit_timestamp 元数据定义
+
+```protobuf
+message SegmentInfo {
+    // ... 现有字段 ...
+
+    // commit_timestamp: Segment 的 Commit Time（事务提交时间戳）
+    //
+    // 【核心概念】
+    // 两层时间戳系统：
+    //   - row.timestamp (Write Time)      = 数据写入存储的时间
+    //   - commit_timestamp (Commit Time)  = 数据事务提交的时间
+    //
+    // 【使用规则】
+    // 系统中任何涉及以下判断的逻辑，都必须使用 commit_timestamp（如果非零）：
+    //   1. 时序比较：数据是否在某个时间点"存在"
+    //   2. 因果关系：操作 A 是否发生在操作 B 之前/之后
+    //   3. 一致性：跨集群的时间戳一致性判断
+    //   4. 过滤逻辑：DML 是否应该影响某行数据
+    //
+    // 【影响的组件】
+    //   - QueryNode: DML 过滤、时间旅行查询、一致性快照
+    //   - DataCoord: Segment 时间范围管理、Compaction 触发、GC 决策
+    //   - CDC/Replication: Checkpoint 计算、复制进度判断
+    //   - 监控/诊断: Segment 时间范围展示、延迟统计
+    //
+    // 【生命周期】
+    //   1. Import 执行阶段: commit_timestamp = 0, importing = true (不可查询)
+    //   2. Commit 提交阶段: commit_timestamp = T_commit, importing = false (可查询)
+    //   3. Compaction 标准化阶段: 重写 row.timestamp = commit_timestamp, 清除 commit_timestamp = 0
+    //
+    // 【重要说明】
+    //   - commit_timestamp = 0: Write Time 即 Commit Time（正常 segment）
+    //   - commit_timestamp != 0: Commit Time 覆盖 Write Time（import segment）
+    optional uint64 commit_timestamp = X;
+}
+```
+
+**Effective Timestamp 计算**：
+
+```go
+func GetEffectiveTimestamp(segment *SegmentInfo, rowTimestamp uint64) uint64 {
+    if segment.CommitTimestamp != 0 {
+        return segment.CommitTimestamp  // Import segment: 使用 Commit Time
+    }
+    return rowTimestamp  // 正常 segment: 使用 Write Time
+}
+```
+
+#### 3.6.2 RPC 接口
+
+**CommitImport RPC**：
+
+```protobuf
+rpc CommitImport(CommitImportRequest) returns(common.Status) {}
+
+message CommitImportRequest {
+    common.MsgBase base = 1;
+    string job_id = 2;
+}
+```
+
+- **功能**：提交处于 WaitingCommit 状态的 Import Job
+- **约束**：仅在主集群调用；Job 必须处于 WaitingCommit 状态；幂等操作
+- **执行**：广播 CommitImportMessage → 各集群原子更新元数据
+
+**AbortImport RPC**：
+
+```protobuf
+rpc AbortImport(AbortImportRequest) returns(common.Status) {}
+
+message AbortImportRequest {
+    common.MsgBase base = 1;
+    string job_id = 2;
+}
+```
+
+- **功能**：中止 Import Job，清理所有集群数据和元数据
+- **约束**：仅在主集群调用；可在任何非终止状态调用；幂等操作
+- **执行**：广播 AbortImportMessage → 标记 Segment Dropped → 触发 GC
+
+#### 3.6.3 消息类型
+
+**CommitImportMessage**：
+
+```protobuf
+message CommitImportMsg {
+    commonpb.MsgBase base = 1;  // 包含 T_commit（Commit Time）
+    int64 job_id = 2;
+}
+```
+
+广播目标：Collection 的所有 vchannel，通过 CDC 链路传播至从集群。
+
+**AbortImportMessage**：
+
+```protobuf
+message AbortImportMsg {
+    commonpb.MsgBase base = 1;
+    int64 job_id = 2;
+}
+```
+
+广播目标：Collection 的所有 vchannel，通过 CDC 链路传播至从集群。
+
+#### 3.6.4 组件改造
+
+| 组件 | 改造内容 | 复杂度 |
+|------|----------|--------|
+| **Meta 存储** | • SegmentInfo proto 新增 `commit_timestamp` 字段<br>• 引入两层时间戳系统（Write Time + Commit Time） | 低 |
+| **DataCoord** | • 新增 WaitingCommit/Committing 状态处理<br>• 实现 CommitImport/AbortImport RPC<br>• 自动提交逻辑（非复制集群）<br>• Commit 时设置 segment.commit_timestamp | 中 |
+| **QueryNode** | • DML 过滤逻辑使用 effective_timestamp<br>• 时间旅行查询使用 effective_timestamp<br>• 一致性快照使用 effective_timestamp | 中 |
+| **ImportChecker** | • WaitingCommit 状态检查<br>• 自动提交判断逻辑<br>• 多 vchannel 确认状态跟踪 | 低 |
+| **Compaction** | • 标准化 import segment 时间戳（重写 row.timestamp）<br>• 清除 commit_timestamp 元数据 | 低 |
+| **CDC/Replication** | • Checkpoint 计算使用 commit_timestamp<br>• 复制进度判断使用 commit_timestamp | 低 |
+| **Proto 定义** | • 新增消息类型<br>• 新增 RPC 定义<br>• 状态枚举扩展 | 低 |
 
 ---
 
