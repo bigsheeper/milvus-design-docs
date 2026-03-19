@@ -104,7 +104,13 @@ T=61000: 从集群通过 CDC 收到 DELETE 消息 (delete.timestamp=T50000)
 
 ### 3.2 三个关键设计
 
-#### 3.2.1 Uncommitted 状态
+#### 3.2.1 状态扩展：Uncommitted 与 Committing
+
+**新增两个状态**：
+- **Uncommitted**：数据物理准备完成，等待 Commit
+- **Committing**：CommitImportMessage 已广播，等待所有 vchannel 处理完成
+
+**Uncommitted 状态**
 
 **作用**：将"物理准备完成"与"数据可见"解耦。
 
@@ -113,12 +119,22 @@ T=61000: 从集群通过 CDC 收到 DELETE 消息 (delete.timestamp=T50000)
 - 标记 `importing=true`，查询不可见
 - Job 元数据持久化在 etcd
 
+**Committing 状态**
+
+**作用**：协调多 vchannel 场景下的 Commit 操作。
+
+**触发**：平台侧调用 CommitImport RPC 后，广播 CommitImportMessage 到所有 vchannel。
+
+**特征**：
+- CommitImport RPC 立即返回成功（< 100ms）
+- 后台异步等待所有 vchannel 确认完成
+- DML 消息继续正常处理，不阻塞
+
 **状态转换**：
 ```
-IndexBuilding → Uncommitted
+IndexBuilding → Uncommitted → Committing → Completed
                 ↓
-    收到 CommitImportMessage → Completed
-    收到 AbortImportMessage  → Failed
+    收到 AbortImportMessage → Failed
 ```
 
 **触发机制**：
@@ -160,10 +176,14 @@ func GetEffectiveTimestamp(segment *SegmentInfo, rowTimestamp uint64) uint64 {
 
 **广播机制**：CommitImportMessage 通过 Collection 的所有 vchannel 传播，CDC 链路复制到从集群。
 
-**原子转换**：各集群接收消息后本地原子执行：
+**处理流程**：
+1. **Uncommitted → Committing**：CommitImport RPC 广播消息，立即返回
+2. **Committing → Completed**：所有 vchannel 处理完成后转换
+
+**vchannel 本地原子操作**：
 - 更新元数据：`segment.commit_timestamp = T_commit`
 - 清除标记：`segment.importing = false`
-- 状态转换：`Job Uncommitted → Completed`
+- 确认完成：标记该 vchannel 已处理
 
 ### 3.3 方案如何解决一致性问题
 
@@ -242,12 +262,11 @@ T=3000: CommitImport 广播，segment.commit_timestamp=3000（Commit Time，与�
 2. **DML 消费问题**：commit 期间是否阻塞 DML？阻塞影响吞吐，不阻塞如何保证写一致性？
 3. **写一致性问题**：v1 已设置 commit_timestamp，v2 还没设置，DELETE 操作在两个 vchannel 上行为是否一致？
 
-**方案：异步等待 + 不阻塞 DML**
+**方案：Committing 状态 + 异步等待 + 不阻塞 DML**
 
-**三个关键机制**：
-1. **新增 Committing 状态**：表示"已发起 commit，等待所有 vchannel 确认"
-2. **CommitImport RPC 立即返回**：不等待所有 vchannel，直接返回成功
-3. **Background checker 异步监控**：定期检查所有 vchannel 是否确认完成，全部完成后转到 Completed
+Committing 状态（已在 3.2.1 引入）在这里解决多 vchannel 协调问题：
+- **CommitImport RPC 立即返回**：不等待所有 vchannel，直接返回成功
+- **Background checker 异步监控**：定期检查所有 vchannel 是否确认完成，全部完成后转到 Completed
 
 **完整流程**：
 
@@ -291,24 +310,10 @@ T=3000: CommitImport 广播，segment.commit_timestamp=3000（Commit Time，与�
   - 最终所有 vchannel 设置完成后，行为一致
 - **Job 状态一致性**：通过 Committing 中间状态避免过早标记 Completed
 
-**状态机扩展**：
-
-```
-原状态机 (8 状态):
-Pending → PreImporting → Importing → Sorting → IndexBuilding → Completed
-           ↓              ↓           ↓            ↓              ↓
-                            Failed (任意阶段)
-
-新状态机 (10 状态):
-Pending → PreImporting → Importing → Sorting → IndexBuilding → Uncommitted → Committing → Completed
-           ↓              ↓           ↓            ↓               ↓              ↓            ↓
-                            Failed (任意阶段，或显式 AbortImport)
-```
-
-**状态语义**：
-- **Uncommitted**：等待平台侧调用 CommitImport RPC（复制集群）或自动提交（非复制集群）
-- **Committing**：CommitImportMessage 已广播，等待所有 vchannel 确认完成
-- **Completed**：所有 vchannel 已完成 commit，数据全局可见
+**实现要点**：
+- **异步转换检查**：DataCoord 后台 goroutine 定期扫描 Committing 状态的 job
+- **vchannel 确认机制**：每个 vchannel 处理完成后更新 etcd 确认标记
+- **状态转换条件**：所有 vchannel 确认完成 → Committing → Completed
 
 ### 3.5 完整流程
 
