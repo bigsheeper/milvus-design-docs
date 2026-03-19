@@ -815,8 +815,8 @@ Each vchannel processes `CommitImportMessage` independently. DataCoord broadcast
 // DataCoord.CommitImport RPC
 func (s *Server) CommitImport(ctx context.Context, req *internalpb.CommitImportRequest) error {
     job := s.meta.GetJob(req.JobID)
-    if job.State != ImportJobStateV2_WaitingCommit {
-        return merr.WrapErr("job not in WaitingCommit state")
+    if job.State != ImportJobStateV2_Uncommitted {
+        return merr.WrapErr("job not in Uncommitted state")
     }
 
     // Broadcast to all vchannels (fire and forget)
@@ -836,7 +836,7 @@ func (s *Server) CommitImport(ctx context.Context, req *internalpb.CommitImportR
 ```
 
 **Problems:**
-1. **Partial visibility**: First vchannel that processes the message marks job as `Completed`, but other vchannels may still be in `WaitingCommit`
+1. **Partial visibility**: First vchannel that processes the message marks job as `Completed`, but other vchannels may still be in `Uncommitted`
 2. **Query inconsistency**: Queries see different data depending on which vchannel they hit
 3. **Cross-cluster divergence**: In replication scenarios, primary and secondary clusters can have different visible data
 
@@ -853,8 +853,8 @@ DataCoord waits for all vchannels to acknowledge `CommitImportMessage` before re
 // DataCoord.CommitImport RPC (blocking version)
 func (s *Server) CommitImport(ctx context.Context, req *internalpb.CommitImportRequest) error {
     job := s.meta.GetJob(req.JobID)
-    if job.State != ImportJobStateV2_WaitingCommit {
-        return merr.WrapErr("job not in WaitingCommit state")
+    if job.State != ImportJobStateV2_Uncommitted {
+        return merr.WrapErr("job not in Uncommitted state")
     }
 
     // Initialize commit tracking
@@ -956,7 +956,7 @@ T3: vchannel v3 processes CommitImportMessage
 ### Approach C: Async Wait with Committing State ⭐ RECOMMENDED
 
 **Design:**
-Introduce a new `Committing` state between `WaitingCommit` and `Completed`. CommitImport RPC returns immediately after initiating the broadcast. A background checker monitors progress and transitions to `Completed` when all vchannels acknowledge.
+Introduce a new `Committing` state between `Uncommitted` and `Completed`. CommitImport RPC returns immediately after initiating the broadcast. A background checker monitors progress and transitions to `Completed` when all vchannels acknowledge.
 
 #### Proto Changes
 
@@ -968,7 +968,7 @@ enum ImportJobStateV2 {
     PreImporting = 2;
     Importing = 3;
     IndexBuilding = 4;
-    WaitingCommit = 8;
+    Uncommitted = 8;
     Committing = 9;     // NEW STATE
     Completed = 10;
     Failed = 11;
@@ -988,8 +988,8 @@ message CommitTrackingInfo {
 // DataCoord.CommitImport RPC (non-blocking version)
 func (s *Server) CommitImport(ctx context.Context, req *internalpb.CommitImportRequest) (*commonpb.Status, error) {
     job := s.meta.GetJob(req.JobID)
-    if job.State != ImportJobStateV2_WaitingCommit {
-        return merr.Status(merr.WrapErr("job not in WaitingCommit state")), nil
+    if job.State != ImportJobStateV2_Uncommitted {
+        return merr.Status(merr.WrapErr("job not in Uncommitted state")), nil
     }
 
     // 1. Initialize commit tracking
@@ -1058,8 +1058,8 @@ func (m *meta) TransitionToCommitting(jobID int64, vchannelStatus map[string]boo
         return merr.WrapErrImportFailed("job not found")
     }
 
-    if job.State != ImportJobStateV2_WaitingCommit {
-        return merr.WrapErrImportFailed("job not in WaitingCommit state")
+    if job.State != ImportJobStateV2_Uncommitted {
+        return merr.WrapErrImportFailed("job not in Uncommitted state")
     }
 
     // Atomic state transition + tracking initialization
@@ -1225,7 +1225,7 @@ StreamingNode → ReadWAL() → flowgraph → DDL callback
 
 **Reasoning:**
 
-1. **Isolation via visible_timestamp**: Import segments have `visible_timestamp = T_commit`. Even if the segments exist on disk during `WaitingCommit` state, they are **invisible** to queries because:
+1. **Isolation via visible_timestamp**: Import segments have `visible_timestamp = T_commit`. Even if the segments exist on disk during `Uncommitted` state, they are **invisible** to queries because:
    - QueryNode filters segments based on `visible_timestamp`
    - Only segments with `visible_timestamp <= query_timestamp` are included in results
    - DML operations (INSERT/DELETE/UPSERT) continue normally without seeing hidden import segments
@@ -1240,7 +1240,7 @@ StreamingNode → ReadWAL() → flowgraph → DDL callback
 **Example scenario:**
 
 ```
-T0: Import job in WaitingCommit state
+T0: Import job in Uncommitted state
     └─ Import segments exist on disk with visible_timestamp = T_commit
     └─ Import PKs registered in PK index (importingPKs map)
 
