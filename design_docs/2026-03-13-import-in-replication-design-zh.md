@@ -42,118 +42,51 @@ if channelAssignment.ReplicateConfiguration != nil &&
 
 ## 二、问题场景分析
 
-### 2.1 核心难点：主备数据一致性
-
-在主备复制环境下，Import 操作面临的核心挑战是**如何保证主备集群数据的强一致性**。具体来说，存在以下难点：
-
-#### 难点 1: 导入时机的不确定性
-
-由于 CDC 复制链路存在固有延迟，主从集群的 Import 任务执行完成时间存在时间差。若主集群 Import 完成后立即使数据可查询，而从集群仍处于 Import 执行阶段，将导致：
-
-- **主集群**: 查询结果包含导入数据
-- **从集群**: 查询结果不包含导入数据（处于 Importing 状态）
-- **一致性违背**: 跨集群数据可见性不一致
-
-#### 难点 2: DML 操作与 Import 数据的时序冲突
-
-更严重的问题发生在 **DML 操作（INSERT/DELETE/UPSERT）与 Import 数据交互时**。考虑以下场景：
-
-**场景示例：DELETE 操作与 Import 数据的冲突**
+当 Import 数据在不同集群以不同时间完成时，会导致主备数据不一致。考虑以下场景：
 
 ```
-初始状态：
-- 主集群和从集群都为空
-
+主集群：
 T=1000: 主集群执行 Import
         → ImportMessage 广播，开始导入数据
-        → 导入数据: (pk=1, field="A"), (pk=2, field="B"), (pk=3, field="C")
-        → 此时数据处于"隐藏"状态（importing=true），不可查询
+        → 导入数据: (pk=1,2,3,......)
+        → 导入数据的 row.timestamp=T1000
+        → 数据处于 Uncommitted 状态（不可查询）
 
-T=1500: 从集群通过 CDC 接收到 ImportMessage，开始导入
-        → 导入相同的数据
-        → 数据也处于"隐藏"状态
+T=20000: 主集群 Import 完成
+         → 数据变为 Completed 状态
+         → 数据变为可查询
+         → 用户查询: pk=1,2,3 都可见
 
-T=2000: 用户在主集群执行 DELETE pk=2
-        → DELETE 消息写入 WAL，时间戳 ts=2000
-        → 主集群的 DELETE 只能删除"可见"的数据
-        → 由于 Import 数据还是隐藏的，DELETE 操作"看不到" pk=2
-        → DELETE 执行成功，但实际没有删除任何数据
+T=50000: 用户在主集群执行 DELETE pk=2
+         → DELETE 消息写入 WAL，delete.timestamp=T50000
+         → 主集群根据时间戳逻辑应用删除
+         → 由于 row.timestamp=T1000 < delete.timestamp=T50000
+         → pk=2 被删除
+         → 用户查询: 只有 pk=1, pk=3 可见
 
-T=2500: 主集群 Import 完成，数据变为可查询
-        → 用户查询：pk=1, pk=2, pk=3 都可见
-        → 问题：pk=2 应该在 T=2000 被删除，但现在还在！
+从集群：
+T=1000: 从集群通过 CDC 接收到 ImportMessage
+        → 开始导入相同的数据
+        → 数据处于 Uncommitted 状态
 
-T=3000: 从集群通过 CDC 收到 DELETE 消息 (ts=2000)
-        → 从集群 Import 也完成了，数据可查询
-        → 但是从集群会应用 DELETE 吗？
+T=30000: 从集群 Import 完成（晚于主集群）
+         → 数据变为 Completed 状态
+         → 数据变为可查询
+         → 用户查询: pk=1,2,3 都可见
+
+T=61000: 从集群通过 CDC 收到 DELETE 消息 (delete.timestamp=T50000)
+         → 从集群根据时间戳逻辑应用删除
+         → 由于 row.timestamp=T1000 < delete.timestamp=T50000
+         → pk=2 被删除
+         → 用户查询: 只有 pk=1, pk=3 可见
+
+结果：主备数据一致性依赖于 Import 完成时间
+      - 若 Import 在 DELETE 之前完成：数据被正确删除
+      - 若 Import 在 DELETE 之后完成：数据无法被删除
+      - 主备集群的 Import 完成时间不同 → 主备数据不一致
 ```
 
-**问题的根源：时间戳语义不一致**
-
-当前 Milvus 的 Import 实现有一个关键问题：**导入的数据使用 ImportMessage 广播时的时间戳**，而不是数据变为可查询时的时间戳。
-
-```go
-// 文件: internal/datanode/importv2/util.go (lines 188-226)
-func AppendSystemFieldsData(task *ImportTask, data *storage.InsertData, rowNum int) error {
-    tss := make([]int64, rowNum)
-    ts := int64(task.req.GetTs())  // 所有行使用 T_import (广播时间)
-    for i := 0; i < rowNum; i++ {
-        tss[i] = ts
-    }
-    data.Data[common.TimeStampField] = &storage.Int64FieldData{Data: tss}
-}
-```
-
-这导致了时间顺序的混乱：
-
-```
-T=1000: Import 数据写入，row.timestamp = 1000（逻辑上应该不可见）
-T=2000: DELETE pk=2, delete.timestamp = 2000
-T=3000: Import 数据提交，变为可查询
-
-查询时的过滤逻辑:
-    if row.timestamp <= delete.timestamp:
-        delete_row()  # 1000 <= 2000，应该删除
-
-预期: pk=2 应该被删除（因为 row.ts=1000 < delete.ts=2000）
-实际: pk=2 在 T=3000 才出现，在 T=2000 时"逻辑上不存在"
-```
-
-**核心矛盾：**
-- Import 数据的 `row.timestamp` 是 T_import（早期时间）
-- 但数据的"逻辑可见时间"是 T_commit（晚期时间）
-- DML 操作在中间发生，应该怎么处理？
-
-**跨集群不一致性：**
-
-更糟糕的是，主备集群可能会有不同的行为：
-
-```
-主集群:
-T=1000: Import 开始，数据隐藏
-T=2000: DELETE pk=2（没有删除隐藏数据）
-T=3000: Import 提交，pk=2 出现
-→ 结果: pk=2 可见
-
-从集群:
-T=1000: Import 开始，数据隐藏
-T=3000: Import 提交，pk=2 出现
-T=3100: CDC 延迟后收到 DELETE (ts=2000)
-        → 由于 row.ts=1000 < delete.ts=2000
-        → pk=2 被删除
-→ 结果: pk=2 不可见
-
-最终: 主备数据不一致！
-```
-
-### 2.2 问题总结
-
-Import 在复制场景下的核心难点：
-
-1. **时机同步问题**: 主备集群 Import 任务不会同时完成，需要协调提交时机
-2. **时间戳语义问题**: Import 数据的时间戳不能反映其逻辑可见性
-3. **DML 交互问题**: Import 期间的 DML 操作可能导致主备不一致
-4. **用户预期违反**: DELETE 后的数据可能"复活"，违反用户预期
+**核心问题**：Import 数据使用 `row.timestamp` 作为数据可见性判断的唯一标准，而 `row.timestamp` 是 ImportMessage 广播时间，不能反映数据的真实可见时间（Import 完成时间），导致跨集群一致性无法保证。
 
 ---
 
