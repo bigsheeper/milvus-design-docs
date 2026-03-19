@@ -268,10 +268,16 @@ func GetEffectiveTimestamp(segment *SegmentInfo, rowTimestamp uint64) uint64 {
 
 #### 3.4.1 复制集群导入流程
 
-**关键步骤**：
-1. **Prepare**：各集群执行 Import → Uncommitted
-2. **Coordination**：平台侧轮询确认所有集群状态
-3. **Commit**：广播 CommitImportMessage → 统一可见
+复制集群导入采用两阶段提交协议，通过平台侧协调保证主备集群的数据一致性：
+
+**Prepare 阶段**：平台侧在主集群调用 ImportV2，主集群广播 ImportMessage 执行数据导入并构建索引，Job 到达 Uncommitted 状态（数据物理准备完成但不可查询）。从集群通过 CDC 接收 ImportMessage，同样执行导入并到达 Uncommitted 状态。平台侧轮询所有集群的 Job 状态，确认全部到达 Uncommitted。
+
+**Commit 阶段**：平台侧在任一集群（通常是主集群）调用 CommitImport RPC，该集群的 DataCoord 广播 CommitImportMessage 到所有 vchannel，从集群通过 CDC 接收该消息。主从集群的各个 vchannel 独立处理消息，设置 segments 的 commit_timestamp 为统一的事务时间。所有 vchannel 完成后，Job 转为 Completed，数据在主从集群同时可查询。
+
+**关键点**：
+- 主从集群使用相同的 commit_timestamp，保证时序判断一致性
+- 平台侧协调 Commit 时机，确保主备原子切换可见性
+- Job 进入 Committing 状态后必须成功完成，不能 Abort 或 Fail（vchannel 独立提交且不可回滚）
 
 **复制集群导入流程图**：
 
