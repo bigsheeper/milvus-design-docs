@@ -171,7 +171,7 @@ Import 在复制场景下的核心难点：
 
 ### 3.2 三个关键设计
 
-#### 3.2.1 WaitingCommit 状态
+#### 3.2.1 Uncommitted 状态
 
 **作用**：将"物理准备完成"与"数据可见"解耦。
 
@@ -182,7 +182,7 @@ Import 在复制场景下的核心难点：
 
 **状态转换**：
 ```
-IndexBuilding → WaitingCommit
+IndexBuilding → Uncommitted
                 ↓
     收到 CommitImportMessage → Completed
     收到 AbortImportMessage  → Failed
@@ -230,7 +230,7 @@ func GetEffectiveTimestamp(segment *SegmentInfo, rowTimestamp uint64) uint64 {
 **原子转换**：各集群接收消息后本地原子执行：
 - 更新元数据：`segment.commit_timestamp = T_commit`
 - 清除标记：`segment.importing = false`
-- 状态转换：`Job WaitingCommit → Completed`
+- 状态转换：`Job Uncommitted → Completed`
 
 ### 3.3 方案如何解决一致性问题
 
@@ -280,7 +280,7 @@ T=61000: 备集群 Import 完成
 ```
 主集群：
 T=1000: Import 执行，row.timestamp=1000（Write Time）
-        → WaitingCommit, segment.commit_timestamp=0
+        → Uncommitted, segment.commit_timestamp=0
 T=2000: DELETE pk=2, delete.ts=2000
 T=3000: CommitImport 广播，segment.commit_timestamp=3000（Commit Time）
         → 系统时序判断: effective_ts (3000) > delete.ts (2000)
@@ -288,7 +288,7 @@ T=3000: CommitImport 广播，segment.commit_timestamp=3000（Commit Time）
 
 备集群：
 T=1000: Import 执行，row.timestamp=1000（Write Time）
-        → WaitingCommit, segment.commit_timestamp=0
+        → Uncommitted, segment.commit_timestamp=0
 T=2000: DELETE pk=2, delete.ts=2000
 T=3000: CommitImport 广播，segment.commit_timestamp=3000（Commit Time，与主集群相同）
         → 系统时序判断: effective_ts (3000) > delete.ts (2000)
@@ -323,7 +323,7 @@ T=3000: CommitImport 广播，segment.commit_timestamp=3000（Commit Time，与�
 │ T1: 平台侧调用 CommitImport RPC                             │
 │     DataCoord 处理：                                        │
 │     ├─ 初始化跟踪：{v1: false, v2: false, v3: false}       │
-│     ├─ 状态转换：WaitingCommit → Committing               │
+│     ├─ 状态转换：Uncommitted → Committing               │
 │     ├─ 广播 CommitImportMessage 到所有 vchannel           │
 │     └─ 立即返回 success ✅ (< 100ms)                       │
 └─────────────────────────────────────────────────────────────┘
@@ -367,13 +367,13 @@ Pending → PreImporting → Importing → Sorting → IndexBuilding → Complet
                             Failed (任意阶段)
 
 新状态机 (10 状态):
-Pending → PreImporting → Importing → Sorting → IndexBuilding → WaitingCommit → Committing → Completed
+Pending → PreImporting → Importing → Sorting → IndexBuilding → Uncommitted → Committing → Completed
            ↓              ↓           ↓            ↓               ↓              ↓            ↓
                             Failed (任意阶段，或显式 AbortImport)
 ```
 
 **状态语义**：
-- **WaitingCommit**：等待平台侧调用 CommitImport RPC（复制集群）或自动提交（非复制集群）
+- **Uncommitted**：等待平台侧调用 CommitImport RPC（复制集群）或自动提交（非复制集群）
 - **Committing**：CommitImportMessage 已广播，等待所有 vchannel 确认完成
 - **Completed**：所有 vchannel 已完成 commit，数据全局可见
 
@@ -382,7 +382,7 @@ Pending → PreImporting → Importing → Sorting → IndexBuilding → Waiting
 #### 3.5.1 复制集群导入流程
 
 **关键步骤**：
-1. **Prepare**：各集群执行 Import → WaitingCommit
+1. **Prepare**：各集群执行 Import → Uncommitted
 2. **Coordination**：平台侧轮询确认所有集群状态
 3. **Commit**：广播 CommitImportMessage → 统一可见
 
@@ -400,7 +400,7 @@ Pending → PreImporting → Importing → Sorting → IndexBuilding → Waiting
 │         ↓                                                          │
 │  DataNode 执行: 读取对象存储 → 写入 binlog (row.ts=T_import)     │
 │         ↓                                                          │
-│  Job 状态: Pending → Importing → IndexBuilding → WaitingCommit   │
+│  Job 状态: Pending → Importing → IndexBuilding → Uncommitted   │
 │         ↓                                                          │
 │  segment.importing=true, commit_timestamp=0 (数据不可见)          │
 │         ↓                                                          │
@@ -412,7 +412,7 @@ Pending → PreImporting → Importing → Sorting → IndexBuilding → Waiting
 │         ↓                                                          │
 │  原子更新: segment.commit_timestamp=T_commit, importing=false     │
 │         ↓                                                          │
-│  Job 状态: WaitingCommit → Completed                              │
+│  Job 状态: Uncommitted → Completed                              │
 └──────────────────────────────────────────────────────────────────┘
                            │
                            │ CDC 链路传播
@@ -426,7 +426,7 @@ Pending → PreImporting → Importing → Sorting → IndexBuilding → Waiting
 │         ↓                                                          │
 │  DataNode 执行: 读取对象存储 → 写入 binlog (row.ts=T_import)     │
 │         ↓                                                          │
-│  Job 状态: Pending → Importing → IndexBuilding → WaitingCommit   │
+│  Job 状态: Pending → Importing → IndexBuilding → Uncommitted   │
 │         ↓                                                          │
 │  segment.importing=true, commit_timestamp=0 (数据不可见)          │
 │         ↓                                                          │
@@ -436,7 +436,7 @@ Pending → PreImporting → Importing → Sorting → IndexBuilding → Waiting
 │         ↓                                                          │
 │  原子更新: segment.commit_timestamp=T_commit, importing=false     │
 │         ↓                                                          │
-│  Job 状态: WaitingCommit → Completed                              │
+│  Job 状态: Uncommitted → Completed                              │
 └──────────────────────────────────────────────────────────────────┘
 ```
 
@@ -452,7 +452,7 @@ Pending → PreImporting → Importing → Sorting → IndexBuilding → Waiting
 │                                                                    │
 │  平台侧调用: ImportV2(jobID, files, options)                      │
 │         ↓                                                          │
-│  Job 状态: Pending → Importing → IndexBuilding → WaitingCommit   │
+│  Job 状态: Pending → Importing → IndexBuilding → Uncommitted   │
 │         ↓                                                          │
 │  ImportChecker 检测非复制配置                                     │
 │         ↓                                                          │
@@ -460,7 +460,7 @@ Pending → PreImporting → Importing → Sorting → IndexBuilding → Waiting
 │         ↓                                                          │
 │  原子更新: segment.commit_timestamp=T_commit, importing=false     │
 │         ↓                                                          │
-│  Job 状态: WaitingCommit → Completed (自动，无需平台侧干预)      │
+│  Job 状态: Uncommitted → Completed (自动，无需平台侧干预)      │
 └──────────────────────────────────────────────────────────────────┘
 ```
 
@@ -530,8 +530,8 @@ message CommitImportRequest {
 }
 ```
 
-- **功能**：提交处于 WaitingCommit 状态的 Import Job
-- **约束**：仅在主集群调用；Job 必须处于 WaitingCommit 状态；幂等操作
+- **功能**：提交处于 Uncommitted 状态的 Import Job
+- **约束**：仅在主集群调用；Job 必须处于 Uncommitted 状态；幂等操作
 - **执行**：广播 CommitImportMessage → 各集群原子更新元数据
 
 **AbortImport RPC**：
@@ -578,9 +578,9 @@ message AbortImportMsg {
 | 组件 | 改造内容 | 复杂度 |
 |------|----------|--------|
 | **Meta 存储** | • SegmentInfo proto 新增 `commit_timestamp` 字段<br>• 引入两层时间戳系统（Write Time + Commit Time） | 低 |
-| **DataCoord** | • 新增 WaitingCommit/Committing 状态处理<br>• 实现 CommitImport/AbortImport RPC<br>• 自动提交逻辑（非复制集群）<br>• Commit 时设置 segment.commit_timestamp | 中 |
+| **DataCoord** | • 新增 Uncommitted/Committing 状态处理<br>• 实现 CommitImport/AbortImport RPC<br>• 自动提交逻辑（非复制集群）<br>• Commit 时设置 segment.commit_timestamp | 中 |
 | **QueryNode** | • DML 过滤逻辑使用 effective_timestamp<br>• 时间旅行查询使用 effective_timestamp<br>• 一致性快照使用 effective_timestamp | 中 |
-| **ImportChecker** | • WaitingCommit 状态检查<br>• 自动提交判断逻辑<br>• 多 vchannel 确认状态跟踪 | 低 |
+| **ImportChecker** | • Uncommitted 状态检查<br>• 自动提交判断逻辑<br>• 多 vchannel 确认状态跟踪 | 低 |
 | **Compaction** | • 标准化 import segment 时间戳（重写 row.timestamp）<br>• 清除 commit_timestamp 元数据 | 低 |
 | **CDC/Replication** | • Checkpoint 计算使用 commit_timestamp<br>• 复制进度判断使用 commit_timestamp | 低 |
 | **Proto 定义** | • 新增消息类型<br>• 新增 RPC 定义<br>• 状态枚举扩展 | 低 |
@@ -625,19 +625,19 @@ watch -n 5 'curl "http://secondary-1:19530/v2/vectordb/jobs/import/get_progress?
 watch -n 5 'curl "http://secondary-2:19530/v2/vectordb/jobs/import/get_progress?jobId=job-123456"'
 ```
 
-**等待所有集群都达到 WaitingCommit 状态：**
+**等待所有集群都达到 Uncommitted 状态：**
 
 ```json
 {
   "jobId": "job-123456",
-  "state": "WaitingCommit",
+  "state": "Uncommitted",
   "progress": 100
 }
 ```
 
 #### 步骤 3: 提交导入（主集群）
 
-**重要:** 只有在所有集群都处于 WaitingCommit 时才能提交！
+**重要:** 只有在所有集群都处于 Uncommitted 时才能提交！
 
 ```bash
 curl -X POST "http://primary:19530/v2/vectordb/jobs/import/commit" \
@@ -687,7 +687,7 @@ curl -X POST "http://primary:19530/v2/vectordb/jobs/import/abort" \
 # 重新发起 import
 ```
 
-#### 情况 2: CommitImport 后发现某个从集群仍是 WaitingCommit
+#### 情况 2: CommitImport 后发现某个从集群仍是 Uncommitted
 
 **原因:** 网络问题导致 CommitImportMessage 丢失。
 
@@ -710,7 +710,7 @@ curl -X POST "http://primary:19530/v2/vectordb/jobs/import/commit" \
 curl -X POST "http://standalone:19530/v2/vectordb/jobs/import/create" \
   -d '{"collectionName": "my_collection", "files": ["s3://bucket/data.parquet"]}'
 
-# 2. 监控进度（WaitingCommit 状态会自动跳过）
+# 2. 监控进度（Uncommitted 状态会自动跳过）
 watch -n 5 'curl "http://standalone:19530/v2/vectordb/jobs/import/get_progress?jobId=xxx"'
 
 # 3. 等待完成（无需手动 commit）
@@ -733,7 +733,7 @@ watch -n 5 'curl "http://standalone:19530/v2/vectordb/jobs/import/get_progress?j
 
 **提交前确认:**
 
-- [ ] 所有集群的 job 状态都是 WaitingCommit
+- [ ] 所有集群的 job 状态都是 Uncommitted
 - [ ] 所有集群的进度都是 100%
 - [ ] 检查 importedRows 数量一致
 
@@ -757,8 +757,8 @@ watch -n 5 'curl "http://standalone:19530/v2/vectordb/jobs/import/get_progress?j
 目标: 验证非复制集群的向后兼容性
 步骤:
   1. 在非复制集群上启动 import
-  2. 监控状态转换: Pending → Importing → IndexBuilding → WaitingCommit → Completed
-  3. 验证 WaitingCommit 状态立即自动转换为 Completed（无用户干预）
+  2. 监控状态转换: Pending → Importing → IndexBuilding → Uncommitted → Completed
+  3. 验证 Uncommitted 状态立即自动转换为 Completed（无用户干预）
   4. 验证数据可查询
 验收:
   - 用户无需调用 CommitImport
@@ -772,8 +772,8 @@ watch -n 5 'curl "http://standalone:19530/v2/vectordb/jobs/import/get_progress?j
 配置: 1 主集群 + 2 从集群
 步骤:
   1. 在主集群启动 import
-  2. 监控所有集群状态，等待都达到 WaitingCommit
-  3. 验证 WaitingCommit 状态下数据不可查询
+  2. 监控所有集群状态，等待都达到 Uncommitted
+  3. 验证 Uncommitted 状态下数据不可查询
   4. 在主集群调用 CommitImport
   5. 验证所有集群转换为 Completed
   6. 验证所有集群数据可查询且一致
@@ -791,7 +791,7 @@ watch -n 5 'curl "http://standalone:19530/v2/vectordb/jobs/import/get_progress?j
 目标: 验证 commit_timestamp 正确处理 commit 前的 DELETE
 步骤:
   1. Import 数据: (pk=1, field="A"), (pk=2, field="B"), (pk=3, field="C")
-  2. 等待达到 WaitingCommit（数据隐藏）
+  2. 等待达到 Uncommitted（数据隐藏）
   3. 执行 DELETE pk=2
   4. 验证查询无结果（数据隐藏）
   5. CommitImport
@@ -807,7 +807,7 @@ watch -n 5 'curl "http://standalone:19530/v2/vectordb/jobs/import/get_progress?j
 目标: 验证 commit 后的 DELETE 正确应用
 步骤:
   1. Import 数据: (pk=1, field="A"), (pk=2, field="B"), (pk=3, field="C")
-  2. 等待 WaitingCommit 并 CommitImport
+  2. 等待 Uncommitted 并 CommitImport
   3. 验证查询到 3 条数据
   4. 执行 DELETE pk=2
   5. 查询数据
@@ -838,7 +838,7 @@ watch -n 5 'curl "http://standalone:19530/v2/vectordb/jobs/import/get_progress?j
 ```
 目标: 验证中止操作正确清理
 步骤:
-  1. Import 到 WaitingCommit
+  1. Import 到 Uncommitted
   2. 调用 AbortImport
   3. 验证所有集群转换为 Failed
   4. 验证数据不可查询
@@ -855,7 +855,7 @@ watch -n 5 'curl "http://standalone:19530/v2/vectordb/jobs/import/get_progress?j
 目标: 验证过早提交的行为
 配置: 1 主 + 2 从
 步骤:
-  1. Import，主集群和从集群1 到达 WaitingCommit
+  1. Import，主集群和从集群1 到达 Uncommitted
   2. 从集群2 人为延迟（断网或暂停进程），仍在 IndexBuilding
   3. 用户错误地调用 CommitImport（未检查从集群2）
   4. 观察各集群状态
@@ -872,11 +872,11 @@ watch -n 5 'curl "http://standalone:19530/v2/vectordb/jobs/import/get_progress?j
 ```
 目标: 验证消息丢失和重试机制
 步骤:
-  1. Import 到 WaitingCommit
+  1. Import 到 Uncommitted
   2. 模拟从集群2网络故障
   3. 主集群 CommitImport（从集群2 收不到消息）
   4. 主集群和从集群1 转换为 Completed
-  5. 发现从集群2 仍是 WaitingCommit
+  5. 发现从集群2 仍是 Uncommitted
   6. 恢复网络
   7. 重试 CommitImport
 验收:
@@ -895,7 +895,7 @@ watch -n 5 'curl "http://standalone:19530/v2/vectordb/jobs/import/get_progress?j
 数据: 1 GB 数据（100万行）
 测量:
   - CommitImport RPC 响应时间
-  - 从 WaitingCommit 到 Completed 的转换时间
+  - 从 Uncommitted 到 Completed 的转换时间
   - CDC 消息传播延迟
 目标:
   - RPC 响应 < 1s
@@ -910,7 +910,7 @@ watch -n 5 'curl "http://standalone:19530/v2/vectordb/jobs/import/get_progress?j
 数据: 10 个并发 job，每个 500MB
 步骤:
   1. 同时启动 10 个 import
-  2. 监控所有 job 到达 WaitingCommit
+  2. 监控所有 job 到达 Uncommitted
   3. 逐个或批量 CommitImport
   4. 验证所有 job 成功完成
 验收:
@@ -944,7 +944,7 @@ watch -n 5 'curl "http://standalone:19530/v2/vectordb/jobs/import/get_progress?j
 目标: 验证从旧版本升级
 场景:
   - 旧版本: 不支持 import in replication
-  - 新版本: 支持 WaitingCommit
+  - 新版本: 支持 Uncommitted
 步骤:
   1. 旧版本集群运行 import（非复制）
   2. 滚动升级到新版本
@@ -965,7 +965,7 @@ watch -n 5 'curl "http://standalone:19530/v2/vectordb/jobs/import/get_progress?j
 #### 限制 1: 无自动一致性验证
 
 **问题描述:**
-CommitImport RPC 执行时不会跨集群验证所有从集群的 Job 状态。若在从集群未达到 WaitingCommit 状态时调用该 RPC，将导致跨集群数据可见性不一致。
+CommitImport RPC 执行时不会跨集群验证所有从集群的 Job 状态。若在从集群未达到 Uncommitted 状态时调用该 RPC，将导致跨集群数据可见性不一致。
 
 **系统行为:**
 - 主集群执行提交，从集群接收到 CommitImportMessage 时仍处于 Importing/IndexBuilding 状态
@@ -977,15 +977,15 @@ CommitImport RPC 执行时不会跨集群验证所有从集群的 Job 状态。�
 - 在可观测性系统中实现跨集群状态聚合视图
 - 通过 API 网关层实现集群状态预检查逻辑
 
-#### 限制 2: WaitingCommit 期间的 DML 交互语义
+#### 限制 2: Uncommitted 期间的 DML 交互语义
 
 **问题描述:**
-WaitingCommit 状态下的 Segment 不参与查询，但与后续 DML 操作存在主键冲突风险。当 Commit 后 Segment 可见时，可能违背 DML 操作的语义预期。
+Uncommitted 状态下的 Segment 不参与查询，但与后续 DML 操作存在主键冲突风险。当 Commit 后 Segment 可见时，可能违背 DML 操作的语义预期。
 
 **场景示例:**
 
 ```
-T=1000: Import segment 包含 pk=2，状态=WaitingCommit（查询不可见）
+T=1000: Import segment 包含 pk=2，状态=Uncommitted（查询不可见）
 T=2000: INSERT pk=2（写入成功，因 Import segment 查询不可见）
 T=2500: DELETE pk=2（删除 T=2000 的 INSERT）
 T=3000: CommitImport → Import segment 的 pk=2 变为可见
