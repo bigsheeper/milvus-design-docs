@@ -185,139 +185,88 @@ func GetEffectiveTimestamp(segment *SegmentInfo, rowTimestamp uint64) uint64 {
 - 清除标记：`segment.importing = false`
 - 确认完成：标记该 vchannel 已处理
 
-### 3.3 方案如何解决一致性问题
+### 3.3 一致性保证
 
-**问题场景（无 commit_timestamp）：**
+**核心原理**
 
-```
-主集群：
-T=1000: 主集群执行 Import
-        → ImportMessage 广播，开始导入数据
-        → 导入数据: (pk=1,2,3,......)
-        → 导入数据的 row.timestamp=T1000
+引入 `commit_timestamp` 作为数据的事务时间基准，将数据的**物理写入时间**（row.timestamp）与**事务提交时间**（commit_timestamp）解耦：
 
-T=2000: 主集群执行 DELETE pk=2
-        → DELETE 消息写入 WAL，时间戳 ts=2000
-......
+- Import 期间：commit_timestamp = 0，数据处于事务未提交状态
+- Commit 时：commit_timestamp = T_commit，数据事务提交
+- DML 操作、Compaction、CDC 等所有时序判断使用 commit_timestamp（若为 0 则使用 row.timestamp）
 
-T=50000: 主集群 Import 完成
-        → 导入数据可见，可见时间=50000
+**两个机制的配合**
 
-T=51000: 主集群触发 L0Compaction
-        → pk=2 Deleted!
+1. **commit_timestamp 保证时序一致性**
+   - Import 数据的事务时间由 CommitImportMessage 中的时间戳确定
+   - 所有集群收到相同的 CommitImportMessage，设置相同的 commit_timestamp
+   - 保证跨集群的时序判断结果一致
 
-备集群：
-T=1000: 备集群通过 CDC 接收到 ImportMessage
-        → ImportMessage 广播，开始导入数据
-        → 导入数据: (pk=1,2,3,......)
-        → 导入数据的 row.timestamp=T1000
+2. **Committing 状态保证 vchannel 间协调**
+   - CommitImport RPC 广播 CommitImportMessage 到所有 vchannel
+   - Job 状态转为 Committing，RPC 立即返回
+   - 各 vchannel 独立设置 commit_timestamp，不阻塞 DML 消费
+   - 所有 vchannel 完成后，Job 转为 Completed
 
-T=2000: 备集群通过 CDC 收到 DELETE 消息 (ts=2000)
-        → DELETE 消息写入 WAL，时间戳 ts=2000
-......
-
-T=60000: 备集群触发 L0Compaction
-        → Import 还未完成
-        → pk=2 NOT Deleted!
-
-T=61000: 备集群 Import 完成
-        → 导入数据可见，可见时间=61000
-        → pk=2 Imported!
-
-结果:
-主备数据不一致!
-```
-
-**方案解决（引入 commit_timestamp）：**
+**多 vchannel Commit 流程**
 
 ```
-主集群：
-T=1000: Import 执行，row.timestamp=1000（Write Time）
-        → Uncommitted, segment.commit_timestamp=0
-T=2000: DELETE pk=2, delete.ts=2000
-T=3000: CommitImport 广播，segment.commit_timestamp=3000（Commit Time）
-        → 系统时序判断: effective_ts (3000) > delete.ts (2000)
-        → pk=2 可见 ✓
-
-备集群：
-T=1000: Import 执行，row.timestamp=1000（Write Time）
-        → Uncommitted, segment.commit_timestamp=0
-T=2000: DELETE pk=2, delete.ts=2000
-T=3000: CommitImport 广播，segment.commit_timestamp=3000（Commit Time，与主集群相同）
-        → 系统时序判断: effective_ts (3000) > delete.ts (2000)
-        → pk=2 可见 ✓
-
-结果:
-主备数据一致！
-```
-
-**解决本质**：引入 `commit_timestamp` 作为系统级 Commit Time，所有集群使用统一的 commit_timestamp 进行时序判断，消除物理执行顺序（如 Compaction 触发时机）差异导致的不一致。
-
-### 3.4 多 vchannel 一致性处理
-
-**问题**：Import job 跨多个 vchannel 时，如何协调 CommitImportMessage 的处理？
-
-**核心挑战**：
-1. **原子性问题**：v1 处理完就标记 job=Completed，v2/v3 还在处理 → job 状态不一致
-2. **DML 消费问题**：commit 期间是否阻塞 DML？阻塞影响吞吐，不阻塞如何保证写一致性？
-3. **写一致性问题**：v1 已设置 commit_timestamp，v2 还没设置，DELETE 操作在两个 vchannel 上行为是否一致？
-
-**方案：Committing 状态 + 异步等待 + 不阻塞 DML**
-
-Committing 状态（已在 3.2.1 引入）在这里解决多 vchannel 协调问题：
-- **CommitImport RPC 立即返回**：不等待所有 vchannel，直接返回成功
-- **Background checker 异步监控**：定期检查所有 vchannel 是否确认完成，全部完成后转到 Completed
-
-**完整流程**：
-
-```
-┌─────────────────────────────────────────────────────────────┐
-│ T1: 平台侧调用 CommitImport RPC                             │
-│     DataCoord 处理：                                        │
-│     ├─ 初始化跟踪：{v1: false, v2: false, v3: false}       │
-│     ├─ 状态转换：Uncommitted → Committing               │
-│     ├─ 广播 CommitImportMessage 到所有 vchannel           │
-│     └─ 立即返回 success ✅ (< 100ms)                       │
-└─────────────────────────────────────────────────────────────┘
-                              │
-          ┌───────────────────┼───────────────────┐
-          ↓                   ↓                   ↓
-  ┌─────────────┐     ┌─────────────┐     ┌─────────────┐
-  │ vchannel v1 │     │ vchannel v2 │     │ vchannel v3 │
-  │             │     │             │     │             │
-  │ T2: 收到消息│     │ T3: 收到消息│     │ T4: 收到消息│
-  │ 设置 commit │     │ (延迟)      │     │ (延迟)      │
-  │ _timestamp  │     │ 设置 commit │     │ 设置 commit │
-  │ 标记确认 ✅ │     │ _timestamp  │     │ _timestamp  │
-  │             │     │ 标记确认 ✅ │     │ 标记确认 ✅ │
-  │ 继续消费DML │     │ 继续消费DML │     │ 继续消费DML │
-  └─────────────┘     └─────────────┘     └─────────────┘
-          │                   │                   │
-          └───────────────────┼───────────────────┘
-                              ↓
-          ┌───────────────────────────────────────┐
-          │ T5: Background Checker 检测           │
-          │     AllVChannelsCommitted? → true     │
-          │     状态转换：Committing → Completed  │
-          └───────────────────────────────────────┘
+                                    ┌─────────────────────────────────────┐
+                                    │  T1: 平台调用 CommitImport RPC     │
+                                    │  DataCoord:                         │
+                                    │  • 状态转换 Uncommitted→Committing │
+                                    │  • 广播 CommitImportMessage(ts=T1) │
+                                    │  • 立即返回 success                │
+                                    └──────────────┬──────────────────────┘
+                                                   │
+                            ┌──────────────────────┼──────────────────────┐
+                            │                      │                      │
+                            ▼                      ▼                      ▼
+                    ┌───────────────┐      ┌───────────────┐      ┌───────────────┐
+                    │  vchannel v1  │      │  vchannel v2  │      │  vchannel v3  │
+                    │ (StreamingNode)│      │ (StreamingNode)│      │ (StreamingNode)│
+                    └───────┬───────┘      └───────┬───────┘      └───────┬───────┘
+                            │                      │                      │
+                            │ T2: flowgraph       │ T3: flowgraph       │ T4: flowgraph
+                            │ /ddNode 收到消息    │ /ddNode 收到消息    │ /ddNode 收到消息
+                            │                      │                      │
+                            ▼                      ▼                      ▼
+                    ┌───────────────┐      ┌───────────────┐      ┌───────────────┐
+                    │  msgHandler   │      │  msgHandler   │      │  msgHandler   │
+                    │.HandleCommit  │      │.HandleCommit  │      │.HandleCommit  │
+                    │   Import      │      │   Import      │      │   Import      │
+                    └───────┬───────┘      └───────┬───────┘      └───────┬───────┘
+                            │                      │                      │
+                            │ 反调 DataCoord      │ 反调 DataCoord      │ 反调 DataCoord
+                            ▼                      ▼                      ▼
+                    ┌───────────────┐      ┌───────────────┐      ┌───────────────┐
+                    │  设置 v1 的   │      │  设置 v2 的   │      │  设置 v3 的   │
+                    │   segments:   │      │   segments:   │      │   segments:   │
+                    │ commit_ts=T1  │      │ commit_ts=T1  │      │ commit_ts=T1  │
+                    │ 标记完成 ✅   │      │ 标记完成 ✅   │      │ 标记完成 ✅   │
+                    └───────┬───────┘      └───────┬───────┘      └───────┬───────┘
+                            │                      │                      │
+                            │ 继续消费 DML        │ 继续消费 DML        │ 继续消费 DML
+                            │                      │                      │
+                            └──────────────────────┼──────────────────────┘
+                                                   │
+                                                   ▼
+                                    ┌─────────────────────────────────────┐
+                                    │  T5: DataCoord Background Checker   │
+                                    │  检测: v1✅ v2✅ v3✅ 全部完成      │
+                                    │  状态转换: Committing → Completed  │
+                                    └─────────────────────────────────────┘
 ```
 
 **关键点**：
-- **DML 不阻塞**：各 vchannel 独立处理 CommitImportMessage，不阻塞后续 DML 消费
-- **写一致性保证**：
-  - 已设置 commit_timestamp 的 vchannel：DELETE 判断使用 Commit Time
-  - 未设置的 vchannel：Segment 仍标记 importing=true，DELETE 不可见该数据
-  - 最终所有 vchannel 设置完成后，行为一致
-- **Job 状态一致性**：通过 Committing 中间状态避免过早标记 Completed
+- StreamingNode 的 flowgraph/ddNode 消费到 CommitImportMessage 后，通过 msgHandler 反调 DataCoord 设置该 vchannel 的 segments 的 commit_timestamp
+- 所有 vchannel 设置相同的 commit_timestamp（来自 CommitImportMessage）
+- 各 vchannel 独立处理，不相互阻塞
+- DML 消息继续正常消费，不受 commit 过程影响
 
-**实现要点**：
-- **异步转换检查**：DataCoord 后台 goroutine 定期扫描 Committing 状态的 job
-- **vchannel 确认机制**：每个 vchannel 处理完成后更新 etcd 确认标记
-- **状态转换条件**：所有 vchannel 确认完成 → Committing → Completed
+### 3.4 完整流程
 
-### 3.5 完整流程
-
-#### 3.5.1 复制集群导入流程
+#### 3.4.1 复制集群导入流程
 
 **关键步骤**：
 1. **Prepare**：各集群执行 Import → Uncommitted
@@ -378,7 +327,7 @@ Committing 状态（已在 3.2.1 引入）在这里解决多 vchannel 协调问�
 └──────────────────────────────────────────────────────────────────┘
 ```
 
-#### 3.5.2 非复制集群导入流程（向后兼容）
+#### 3.4.2 非复制集群导入流程（向后兼容）
 
 **自动提交机制**：ImportChecker 检测到非复制配置，自动广播 CommitImportMessage。
 
@@ -404,9 +353,9 @@ Committing 状态（已在 3.2.1 引入）在这里解决多 vchannel 协调问�
 
 用户观察到的行为：IndexBuilding → Completed（平滑过渡，无感知）
 
-### 3.6 技术实现细节
+### 3.5 技术实现细节
 
-#### 3.6.1 commit_timestamp 元数据定义
+#### 3.5.1 commit_timestamp 元数据定义
 
 ```protobuf
 message SegmentInfo {
@@ -455,7 +404,7 @@ func GetEffectiveTimestamp(segment *SegmentInfo, rowTimestamp uint64) uint64 {
 }
 ```
 
-#### 3.6.2 RPC 接口
+#### 3.5.2 RPC 接口
 
 **CommitImport RPC**：
 
@@ -487,7 +436,7 @@ message AbortImportRequest {
 - **约束**：仅在主集群调用；可在任何非终止状态调用；幂等操作
 - **执行**：广播 AbortImportMessage → 标记 Segment Dropped → 触发 GC
 
-#### 3.6.3 消息类型
+#### 3.5.3 消息类型
 
 **CommitImportMessage**：
 
@@ -511,7 +460,7 @@ message AbortImportMsg {
 
 广播目标：Collection 的所有 vchannel，通过 CDC 链路传播至从集群。
 
-#### 3.6.4 组件改造
+#### 3.5.4 组件改造
 
 | 组件 | 改造内容 | 复杂度 |
 |------|----------|--------|
