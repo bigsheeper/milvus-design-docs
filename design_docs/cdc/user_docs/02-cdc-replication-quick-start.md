@@ -166,13 +166,26 @@ source-cluster-milvus                 ClusterIP   10.98.124.90     <none>       
 target-cluster-milvus                 ClusterIP   10.109.234.172   <none>        19530/TCP,9091/TCP   3m
 ```
 
-If you run the Python client inside the same Kubernetes cluster, use the service DNS names. If you run it outside the cluster, expose the service through your normal access method, such as a load balancer, ingress, or port-forward.
+Prepare two types of addresses:
+
+- Cluster addresses are written to the replication configuration and used by CDC components. These addresses must be reachable from the CDC pods.
+- Client addresses are used only by your Python client when calling Milvus APIs. If you run the Python client outside the Kubernetes cluster, expose the Milvus services through your normal access method, such as a load balancer, ingress, or port-forward.
 
 Prepare the connection information and pchannel lists for both clusters:
 
 ```python
 source_cluster_addr = "http://source-cluster-milvus.milvus.svc.cluster.local:19530"
 target_cluster_addr = "http://target-cluster-milvus.milvus.svc.cluster.local:19530"
+
+source_client_addr = source_cluster_addr
+target_client_addr = target_cluster_addr
+
+# If your Python client runs outside the Kubernetes cluster, replace only
+# source_client_addr and target_client_addr with externally reachable addresses.
+# Keep source_cluster_addr and target_cluster_addr reachable from CDC pods.
+# For example:
+# source_client_addr = "http://127.0.0.1:19530"
+# target_client_addr = "http://127.0.0.1:19531"
 
 source_cluster_token = "root:Milvus"
 target_cluster_token = "root:Milvus"
@@ -191,7 +204,7 @@ target_cluster_pchannels = [
 ]
 ```
 
-Replace the addresses with the actual Milvus service addresses in your environment. The pchannel list must match your Milvus deployment. Do not copy the example values without checking your cluster configuration.
+Replace the addresses with the actual Milvus service addresses in your environment. Do not set `source_cluster_addr` or `target_cluster_addr` to a local port-forward address unless the CDC pods can also reach that address. The pchannel list must match your Milvus deployment. Do not copy the example values without checking your cluster configuration.
 
 ## Step 5: Create the Replication Configuration
 
@@ -234,11 +247,11 @@ Apply the same configuration to both clusters:
 from pymilvus import MilvusClient
 
 source_client = MilvusClient(
-    uri=source_cluster_addr,
+    uri=source_client_addr,
     token=source_cluster_token,
 )
 target_client = MilvusClient(
-    uri=target_cluster_addr,
+    uri=target_client_addr,
     token=target_cluster_token,
 )
 
@@ -260,11 +273,11 @@ Use `get_replicate_configuration` to inspect the current topology:
 
 ```python
 source_client = MilvusClient(
-    uri=source_cluster_addr,
+    uri=source_client_addr,
     token=source_cluster_token,
 )
 target_client = MilvusClient(
-    uri=target_cluster_addr,
+    uri=target_client_addr,
     token=target_cluster_token,
 )
 
@@ -287,8 +300,10 @@ To verify that replication works:
 3. Insert data into the collection.
 4. Load the collection and run a query or search on `source-cluster`.
 5. Connect to `target-cluster`.
-6. Run the same query or search on `target-cluster`.
+6. Run the same query or search on `target-cluster` without manually loading the collection on the standby cluster.
 7. Confirm that the expected data is visible on both clusters.
+
+The target cluster is a standby cluster in this topology. Do not run manual DDL or DCL operations, such as `load_collection`, on the standby cluster. Those operations should be performed on the source cluster and replicated to the target cluster.
 
 The exact verification code depends on your collection schema. For a basic Milvus collection workflow, see the Milvus quick start documentation.
 
