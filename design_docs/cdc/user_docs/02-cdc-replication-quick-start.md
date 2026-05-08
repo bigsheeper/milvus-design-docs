@@ -73,7 +73,6 @@ spec:
     image: milvusdb/milvus:v2.6.16
     cdc:
       replicas: 1
-      config: {}
   dependencies:
     msgStreamType: woodpecker
 ```
@@ -121,7 +120,6 @@ spec:
     image: milvusdb/milvus:v2.6.16
     cdc:
       replicas: 1
-      config: {}
   dependencies:
     msgStreamType: woodpecker
 ```
