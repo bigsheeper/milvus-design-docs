@@ -265,31 +265,7 @@ For production automation, use separate short-lived clients for this control-pla
 
 After the configuration is applied, changes written to `source-cluster` are replicated to `target-cluster`.
 
-## Step 7: Verify the Topology
-
-Use `get_replicate_configuration` to inspect the current topology:
-
-```python
-source_client = MilvusClient(
-    uri=source_client_addr,
-    token=source_cluster_token,
-)
-target_client = MilvusClient(
-    uri=target_client_addr,
-    token=target_cluster_token,
-)
-
-try:
-    print(source_client.get_replicate_configuration())
-    print(target_client.get_replicate_configuration())
-finally:
-    source_client.close()
-    target_client.close()
-```
-
-The returned configuration should contain both clusters and the `source-cluster -> target-cluster` topology. Sensitive fields such as tokens are not returned.
-
-## Step 8: Verify Data Replication
+## Step 7: Verify Data Replication
 
 To verify that replication works:
 
@@ -350,10 +326,6 @@ Yes. Apply the same topology to all participating clusters. If one cluster is no
 ### How should I choose `cluster_id`?
 
 Use a stable, unique ID for each cluster. The ID is also used in pchannel names and replication topology references.
-
-### Are tokens exposed by `get_replicate_configuration`?
-
-No. Sensitive connection fields are sanitized before the configuration is returned.
 
 ### Can I change pchannels after replication is configured?
 
