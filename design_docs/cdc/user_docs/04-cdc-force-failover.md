@@ -58,6 +58,7 @@ Build a configuration that contains only the standby cluster and no replication 
 # If you followed the Quick Start, cluster B is the original target cluster.
 cluster_b_id = target_cluster_id
 cluster_b_addr = target_cluster_addr
+cluster_b_client_addr = target_client_addr
 cluster_b_token = target_cluster_token
 cluster_b_pchannels = target_cluster_pchannels
 
@@ -84,7 +85,7 @@ Send the request to the standby cluster.
 ```python
 from pymilvus import MilvusClient
 
-client_b = MilvusClient(uri=cluster_b_addr, token=cluster_b_token)
+client_b = MilvusClient(uri=cluster_b_client_addr, token=cluster_b_token)
 
 try:
     client_b.update_replicate_configuration(**force_failover_config)
@@ -106,7 +107,7 @@ After promotion:
 Example write verification:
 
 ```python
-client_b = MilvusClient(uri=cluster_b_addr, token=cluster_b_token)
+client_b = MilvusClient(uri=cluster_b_client_addr, token=cluster_b_token)
 
 try:
     client_b.insert(
