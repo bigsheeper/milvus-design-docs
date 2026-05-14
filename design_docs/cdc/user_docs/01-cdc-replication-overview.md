@@ -10,7 +10,7 @@ A typical topology contains:
 
 - **Primary cluster**: The source cluster for replication. It accepts reads and writes.
 - **Standby cluster**: A target cluster for replication. It receives changes from the primary and is read-only while it remains a standby.
-- **CDC node**: A Milvus component that runs with the source cluster and forwards WAL changes to target clusters.
+- **CDC node**: A Milvus component that forwards WAL changes from the current primary to standby clusters. Deploy CDC on each cluster that may become primary after switchover or failover.
 - **Replication topology**: The configured source-to-target relationship, such as `cluster-a -> cluster-b`.
 
 The most common setup is one primary and one standby:
