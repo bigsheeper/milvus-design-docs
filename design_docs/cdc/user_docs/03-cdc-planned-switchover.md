@@ -45,11 +45,13 @@ Create a full replacement configuration where `cluster-b` becomes the source and
 # and cluster B is the original target cluster.
 cluster_a_id = source_cluster_id
 cluster_a_addr = source_cluster_addr
+cluster_a_client_addr = source_client_addr
 cluster_a_token = source_cluster_token
 cluster_a_pchannels = source_cluster_pchannels
 
 cluster_b_id = target_cluster_id
 cluster_b_addr = target_cluster_addr
+cluster_b_client_addr = target_client_addr
 cluster_b_token = target_cluster_token
 cluster_b_pchannels = target_cluster_pchannels
 
@@ -83,13 +85,13 @@ switchover_config = {
 
 ## Apply the New Topology
 
-Apply the same configuration to both clusters.
+Apply the same configuration to both clusters. Send the request to the current primary first, and then send it to the standby. If you later switch back, reverse the order because `cluster-b` is the current primary.
 
 ```python
 from pymilvus import MilvusClient
 
-client_a = MilvusClient(uri=cluster_a_addr, token=cluster_a_token)
-client_b = MilvusClient(uri=cluster_b_addr, token=cluster_b_token)
+client_a = MilvusClient(uri=cluster_a_client_addr, token=cluster_a_token)
+client_b = MilvusClient(uri=cluster_b_client_addr, token=cluster_b_token)
 
 try:
     client_a.update_replicate_configuration(**switchover_config)
