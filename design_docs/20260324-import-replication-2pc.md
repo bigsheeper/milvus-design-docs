@@ -9,7 +9,7 @@
 
 ## Summary
 
-Add Two-Phase Commit (2PC) support to Import so that bulk-loaded data can become visible atomically and consistently across all clusters in a primary/secondary replication setup (GlobalCluster / disaster recovery). Data stays invisible until an explicit commit signal is delivered via WAL, ensuring primary and secondary clusters reach the same visible state at the same logical WAL position.
+Add Two-Phase Commit (2PC) support to Import so that bulk-loaded data becomes visible only after a per-vchannel WAL commit fence, consistently across all clusters in a primary/secondary replication setup (GlobalCluster / disaster recovery). Data stays invisible until an explicit commit signal is delivered via WAL, ensuring primary and secondary clusters reach the same visible state at the same logical WAL position.
 
 ## Motivation
 
@@ -62,9 +62,9 @@ Pending → PreImporting → Importing → Sorting → IndexBuilding → Uncommi
 
 ```protobuf
 enum MessageType {
-  // ...existing values through RefreshExternalCollection=43...
-  CommitImport   = 44;
-  RollbackImport = 45;
+  // ...existing values through DropSnapshotsByCollection=44...
+  CommitImport   = 45;
+  RollbackImport = 46;
 }
 
 message CommitImportMessageHeader {
@@ -98,6 +98,8 @@ Segment visibility is controlled by the existing `is_importing` flag:
 
 No new visibility mechanism is introduced.
 
+Visibility is committed per vchannel, not as a single job-wide metadata flip. `HandleCommitVchannel` first clears `is_importing=false` for the segments on that vchannel, then records the vchannel in `ImportJob.committed_vchannels`. Therefore, a vchannel's imported data can be visible while the job is still `Committing`; the job reaches `Completed` only after all vchannels have been recorded. This ordering is intentional because the commit fence is consumed independently on each vchannel.
+
 ### CommitImport Flow
 
 **Phase 1 — RPC → WAL broadcast (DataCoord)**
@@ -109,10 +111,12 @@ Platform
 Proxy (converts "123" → int64(123))
   → DataCoord.CommitImport(job_id=123)
        │
-       ├─ Validate: job state == Uncommitted; return InvalidState otherwise
-       ├─ Acquire per-job mutex (in-memory sync.Map keyed by job_id)
-       ├─ Broadcast CommitImportMessage{collection_id, job_id} to all vchannels (WAL)
-       └─ Release per-job mutex
+       ├─ Validate: job state == Uncommitted; Committing/Completed are idempotent success
+       ├─ Reject manual commit if job.auto_commit == true
+       ├─ Acquire per-job KeyLock keyed by job_id
+       ├─ Re-read and re-validate job state
+       ├─ Broadcast CommitImportMessage{collection_id, job_id} to job.vchannels (WAL)
+       └─ Release per-job KeyLock
 ```
 
 **Phase 2 — DDL ack callback (DataCoord, fires once for all vchannels)**
@@ -121,9 +125,13 @@ The DDL broadcast ack callback fires once when the message has been successfully
 
 ```
 DDL ack callback:
-  CAS: Uncommitted → Committing
-  (if already Failed: abort won the race → no-op)
+  if job.state == Uncommitted:
+      UpdateJobState(Committing)
+  else:
+      no-op
 ```
+
+No compare-and-swap is needed here. `CommitImport` and `RollbackImport` messages are exclusive collection-level broadcast messages, so the broadcaster resource-key lock serializes their ack callbacks for the same collection. The state guard above determines the winner when commit and abort race.
 
 **Phase 3 — Per-vchannel processing (StreamingNode WAL flusher)**
 
@@ -139,12 +147,14 @@ case CommitImportMessage:
 
 ```
 HandleCommitVchannel(job_id, vchannel):
-  CAS: if vchannel NOT in job.committed_vchannels:
-    - set is_importing=false for all segments in this vchannel
-    - append vchannel to committed_vchannels (persist to etcd)
-  else:
+  if vchannel in job.committed_vchannels:
     no-op (idempotent — handles WAL replay on SN restart)
+
+  - set is_importing=false for all segments in this vchannel
+  - append vchannel to committed_vchannels (persist to etcd)
 ```
+
+The segment visibility update happens before the job metadata update. If the visibility callback fails, the vchannel is not recorded and WAL replay retries the same commit. If the job metadata write fails after visibility has been cleared, the retry runs the idempotent visibility callback again and then records the vchannel.
 
 **Phase 5 — ImportChecker (background, ticker)**
 
@@ -158,13 +168,13 @@ case ImportJobState_Committing:
 
 ### AbortImport Flow
 
-`AbortImport` follows the same broadcast pattern. The DDL ack callback:
-1. CAS: current state → `Failed` (no-op if already `Committing`/`Completed`)
-2. Sets `RequestedDiskSize = 0` (disk quota released)
-3. Sets `CleanupTs = now + retention` (GC eligible)
-4. Marks all import segments for this job as `SegmentState_Dropped`
+`AbortImport` follows the same broadcast pattern and broadcasts `RollbackImportMessage` to `job.vchannels`. The DDL ack callback:
+1. If the job is not `Committing`, `Completed`, or already `Failed`, call `UpdateJobState(Failed)`
+2. No-op if the job is already `Committing`, `Completed`, or `Failed`
 
-A **no-op handler** is registered for `RollbackImport = 45` in `wal_flusher.dispatch()` to prevent unknown-message errors as flowgraph consumes WAL messages.
+`UpdateJobState(Failed)` is the single place that releases the requested disk quota (`RequestedDiskSize = 0`) and sets `CleanupTs = now + retention` for GC eligibility. Import segment cleanup remains on the existing failed-job cleanup path: `ImportChecker` marks this job's import tasks as failed, then `ImportInspector.processFailed` marks the task's import segments as `SegmentState_Dropped` and clears segment IDs from the task metadata. Keeping segment cleanup in the inspector avoids a second segment-drop path in the rollback ack callback.
+
+A **no-op handler** is registered for `RollbackImport = 46` in `wal_flusher.dispatch()` to prevent unknown-message errors as flowgraph consumes WAL messages.
 
 ### auto_commit Checker
 
@@ -183,14 +193,17 @@ case ImportJobState_Committing:
     }
 ```
 
+`checkUncommittedJob` may be invoked more than once while an auto-commit broadcast is in flight. This is safe: the broadcaster's exclusive collection resource key serializes overlapping commit/rollback broadcasts, the ack callbacks are state-guarded, and `HandleCommitVchannel` is idempotent through `committed_vchannels`.
+
 ### Race Safety
 
 | Scenario | Protection |
 |----------|------------|
-| Concurrent CommitImport + AbortImport RPCs | Per-job mutex serializes broadcast; only one message enters WAL first |
-| Commit ack fires before abort ack | Abort ack CAS sees `Committing` → no-op |
-| Abort ack fires before commit ack | Commit ack CAS sees `Failed` → no-op |
-| Duplicate `CommitImportMessage` (WAL replay on SN restart) | `committed_vchannels` CAS in `HandleCommitVchannel` → idempotent no-op |
+| Concurrent CommitImport + AbortImport RPCs | Per-job KeyLock serializes each job's RPC handler; broadcaster exclusive collection resource key serializes ack callbacks |
+| Commit ack fires before abort ack | Commit ack moves `Uncommitted → Committing`; abort ack sees `Committing` → no-op |
+| Abort ack fires before commit ack | Abort ack moves job to `Failed`; commit ack sees non-`Uncommitted` → no-op |
+| Duplicate `CommitImportMessage` (WAL replay on SN restart) | `committed_vchannels` guard in `HandleCommitVchannel` → idempotent no-op |
+| Duplicate auto-commit broadcasts before ack | Resource-key lock + ack state guard make duplicates harmless; only the first successful commit ack moves the job to `Committing` |
 
 ### Platform Workflow (Replication Clusters)
 
@@ -205,6 +218,7 @@ case ImportJobState_Committing:
 ### Implementation Notes
 
 - `CommitImport`/`RollbackImport` messages are handled in `wal_flusher.dispatch()` (same pattern as `CreateCollection`/`DropCollection`), not in `flow_graph_dd_node.go`. This avoids requiring additions to the external milvus-proto `commonpb.MsgType`.
+- Commit and rollback messages must be broadcast to the job's data vchannels, not only to the WAL control channel. A control-channel-only, non-pchannel-level message is dropped by the WAL flusher before the `CommitImport`/`RollbackImport` cases can run, so it cannot drive per-vchannel commit handling.
 - No timeout is applied to the `Committing` state. WAL delivery is guaranteed; upon StreamingNode restart the WAL replays `CommitImportMessage` and `HandleCommitVchannel` idempotency handles the duplicate.
 - `auto_commit` is parsed from `options` KV at job creation time and stored as `bool auto_commit` on the `ImportJob` proto (not re-parsed at check time).
 
@@ -222,12 +236,14 @@ No migration is required. The `Uncommitted` and `Committing` state values (8, 9)
 
 - Unit tests for `IsAutoCommit` helper (`internal/util/importutilv2`)
 - Unit tests for `HandleCommitVchannel` idempotency (duplicate vchannel, nil job, WAL replay)
-- Unit tests for `CommitImport`/`AbortImport` RPC handlers: state validation, per-job mutex, broadcast happy path
-- Unit tests for DDL ack callbacks: commit CAS races (abort wins), rollback CAS races (commit wins), segment drop
-- Unit tests for `ImportChecker` `Uncommitted`/`Committing` cases: auto_commit trigger, all-vchannels-confirmed transition
+- Unit tests for `CommitImport`/`AbortImport` RPC handlers: state validation, per-job KeyLock, broadcast happy path
+- Unit tests for DDL ack callbacks: commit/abort race under resource-key-lock semantics, state guards, failed-state side effects
+- Unit tests for `ImportChecker` `Uncommitted`/`Committing` cases: auto_commit trigger, repeated auto-commit safety, all-vchannels-confirmed transition
+- Unit tests for CommitImport/RollbackImport broadcast targets: messages target `job.vchannels`, not the control channel
 - Unit tests for WAL flusher dispatch: `CommitImportMessage` calls `HandleCommitVchannel`, `RollbackImportMessage` is no-op
 - Unit tests for RESTful handlers: valid `jobId`, invalid `jobId` returns error code 1100
-- Integration: non-replication cluster with default `auto_commit=true` import completes identically to pre-2PC
+- Integration: non-replication cluster with default `auto_commit=true` import completes externally like pre-2PC, while internally passing through `Uncommitted → Committing → Completed`
+- Integration: `auto_commit=false` import keeps data invisible at `Uncommitted`, exposes data after commit, and keeps data invisible after abort
 
 ## Rejected Alternatives
 
